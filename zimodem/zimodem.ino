@@ -14,9 +14,12 @@
    limitations under the License. 
 */
 /*
- * MODIFIED by the o1next project (#330, part of #56): O1NEXT_BOARD added, and a
- * board-profile branch for the O1NEXT WiFi COMM PAC.  The profile itself is
- * o1next.h, so the diff to this file stays two lines.  Apache-2.0 section 4(b).
+ * MODIFIED by the o1next project (#330, #334, part of #56): O1NEXT_BOARD added, a
+ * board-profile branch for the O1NEXT WiFi COMM PAC, and one call from loop()
+ * into the console handler.  The profile is o1next.h and the console is
+ * o1next_console.ino, so what this file carries of the o1next work is the
+ * notice, the define, the two-line branch, the CDC half of debugPrintf, the
+ * two fixed arrays, and that one call.  Apache-2.0 section 4(b).
  */
 //#define TCP_SND_BUF                     4 * TCP_MSS
 #define ZIMODEM_VERSION "4.0.3"
@@ -754,6 +757,9 @@ void loop()
 {
   checkFactoryReset();
   checkReconnect();
+#if defined(O1NEXT_BOARD) && ARDUINO_USB_CDC_ON_BOOT
+  o1nextConsolePoll(); /* the console's commands -- o1next_console.ino (#334) */
+#endif
   if(HWSerial.available())
   {
     currMode->serialIncoming();
