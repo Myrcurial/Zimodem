@@ -1,0 +1,107 @@
+name: build
+
+# A firmware image, on every change to the sketch.
+#
+# Why this workflow lives in the fork rather than in the o1next repository, where
+# every other workflow for this project lives: **the trigger has to be a push to
+# THIS repository.**  A job over there could only ever build a pinned ref, which
+# answers "did the pin build once" -- not "does what was just pushed build",
+# which is the question this exists to answer.
+#
+# It runs exactly one thing, tools/build-o1next.sh, which is also what a person
+# runs.  That is deliberate: CI and the documented recipe cannot drift apart if
+# they are the same command.
+#
+# The artifact is ONE image, flashable at 0x0.  Arduino's own build leaves three
+# binaries plus a fourth from the core, and flashing them means getting four
+# offsets right.  The script merges them and then CHECKS the offsets against the
+# partition table the build just produced, rather than trusting them -- a wrong
+# app offset merges cleanly and does not boot.
+
+on:
+  push:
+    branches: [ o1next ]
+    paths:
+      - 'zimodem/**'
+      - 'tools/build-o1next.sh'
+      - '.github/workflows/build.yml'
+  pull_request:
+    branches: [ o1next ]
+    paths:
+      - 'zimodem/**'
+      - 'tools/build-o1next.sh'
+      - '.github/workflows/build.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  firmware:
+    name: ESP32-S2 firmware image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      # arduino-cli is fetched directly, by version AND checksum, rather than
+      # through an action.
+      #
+      # The action works -- it is what this job used first -- but it is a
+      # third-party action on a Node runtime we do not control, and GitHub had
+      # already had to force it forward from Node 20 to Node 24.  A static binary
+      # fetched by checksum has no runtime to deprecate.  The version is the one
+      # BUILD.md documents and the hash is from the release's own checksums file.
+      #
+      # This runner is Linux, so the asset is Linux_64bit.  Note that
+      # `brew install arduino-cli` on a Mac is a *different* build of 1.5.1, which
+      # is why the local and CI binaries are not the same bytes -- the version is
+      # the contract, not the binary.
+      - name: Install arduino-cli
+        run: |
+          version=1.5.1
+          sha256=28a8e119c498a25607821c36cb2dc49e8463941b261a0d99091baa7bc692dd2b
+          url="https://github.com/arduino/arduino-cli/releases/download/v${version}/arduino-cli_${version}_Linux_64bit.tar.gz"
+          curl -fsSL -o /tmp/arduino-cli.tar.gz "$url"
+          echo "${sha256}  /tmp/arduino-cli.tar.gz" | sha256sum -c -
+          mkdir -p "$HOME/.local/bin"
+          tar -xzf /tmp/arduino-cli.tar.gz -C "$HOME/.local/bin" arduino-cli
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/arduino-cli" version
+
+      # The core is the whole cost of a cold run -- a couple of minutes and a lot
+      # of megabytes -- so it is cached on the exact version.  The version is
+      # pinned, so the key cannot go stale: a cache miss is slow, never wrong.
+      - name: Cache the ESP32 core
+        uses: actions/cache@v5
+        with:
+          path: ~/.arduino15
+          key: arduino-${{ runner.os }}-esp32-2.0.17
+
+      - name: Install the ESP32 core
+        run: |
+          arduino-cli config init --overwrite
+          arduino-cli config add board_manager.additional_urls \
+            https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+          arduino-cli core update-index
+          arduino-cli core install esp32:esp32@2.0.17
+
+      - name: Build, merge and verify
+        run: tools/build-o1next.sh
+
+      - name: shellcheck the build script
+        run: shellcheck -S warning tools/build-o1next.sh
+
+      - name: Upload the firmware
+        uses: actions/upload-artifact@v7
+        with:
+          name: o1next-wifi-comm-pac-firmware
+          if-no-files-found: error
+          path: |
+            build/o1next-s2/zimodem-o1next-merged.bin
+            build/o1next-s2/zimodem.ino.bin
+            build/o1next-s2/zimodem.ino.bootloader.bin
+            build/o1next-s2/zimodem.ino.partitions.bin
+            build/o1next-s2/zimodem.ino.elf
+            build/o1next-s2/SHA256SUMS
+            build/o1next-s2/BUILD-INFO.txt

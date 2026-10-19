@@ -1,0 +1,3 @@
+# Build output.  tools/build-o1next.sh writes here, and it is a build artifact in
+# the ordinary sense: regenerable with one command, and never committed.
+build/
