@@ -23,13 +23,13 @@ on:
     branches: [ o1next ]
     paths:
       - 'zimodem/**'
-      - 'tools/build-o1next.sh'
+      - 'tools/**'
       - '.github/workflows/build.yml'
   pull_request:
     branches: [ o1next ]
     paths:
       - 'zimodem/**'
-      - 'tools/build-o1next.sh'
+      - 'tools/**'
       - '.github/workflows/build.yml'
   workflow_dispatch:
 
@@ -91,6 +91,17 @@ jobs:
 
       - name: shellcheck the build script
         run: shellcheck -S warning tools/build-o1next.sh
+
+      # The tools are Python now -- read-console.py, console-o1next.py,
+      # update-o1next.py, ota-server-o1next.py -- and nothing else looks at them.
+      # A syntax error in one would otherwise be found by running it, on a board,
+      # at the moment it is needed.  This is a parse check and says so: it is not
+      # a test of what the tools do.
+      - name: check the Python tools parse
+        run: |
+          python3 -m py_compile tools/*.py
+          rm -rf tools/__pycache__
+          echo "parsed: $(ls tools/*.py | tr '\n' ' ')"
 
       - name: Upload the firmware
         uses: actions/upload-artifact@v7
