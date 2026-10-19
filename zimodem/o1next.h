@@ -96,4 +96,36 @@
 
 /* INCLUDE_SSH stays on -- it is the point of the S2 (#321). */
 
+/* --------------------------------------------------------------- the console
+ *
+ * The USB CDC is this board's console (see the FQBN: CDCOnBoot=cdc), and the
+ * native-USB trap is that a boot banner printed before the host has opened the
+ * port goes nowhere: the host is re-enumerating during the reset, and by the time
+ * it is attached the firmware has already said everything it was going to say.
+ * Measured, not assumed -- the first console read of a booted board returned
+ * zero bytes.
+ *
+ * So the first debug line waits for the host, once, for at most
+ * O1NEXT_USB_WAIT_MS.  The trade is deliberate: with a host attached the wait
+ * ends as soon as it is seen, and with none attached it costs this much once, at
+ * boot -- which is the case where nobody is reading the console anyway.
+ */
+#define O1NEXT_USB_WAIT_MS 2000u
+
+static void o1next_usb_ready(void)
+{
+    static bool waited = false;
+    unsigned     i;
+
+    if (waited)
+        return;
+    waited = true;
+
+    for (i = 0; i < (O1NEXT_USB_WAIT_MS / 10u); i++) {
+        if (Serial)          /* the host has opened the port */
+            break;
+        delay(10);
+    }
+}
+
 #endif /* O1NEXT_H */
