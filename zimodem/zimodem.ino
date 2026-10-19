@@ -13,6 +13,11 @@
    See the License for the specific language governing permissions and
    limitations under the License. 
 */
+/*
+ * MODIFIED by the o1next project (#330, part of #56): O1NEXT_BOARD added, and a
+ * board-profile branch for the O1NEXT WiFi COMM PAC.  The profile itself is
+ * o1next.h, so the diff to this file stays two lines.  Apache-2.0 section 4(b).
+ */
 //#define TCP_SND_BUF                     4 * TCP_MSS
 #define ZIMODEM_VERSION "4.0.3"
 const char compile_date[] = __DATE__ " " __TIME__;
@@ -34,6 +39,7 @@ const char compile_date[] = __DATE__ " " __TIME__;
 //#define SUPPORT_LED_PINS true // enable if you have the spare gpio pins and leds
 //#define INCLUDE_CMDRX16 true // enable this if you are David or Kevin
 //#define USE_DEVUPDATER true // only enable this if your name is Bo
+#define O1NEXT_BOARD true // the O1NEXT WiFi COMM PAC: our pins and our switches (#330)
 
 // Figure out whether we are building for ESP8266 or ESP32
 #if defined(ARDUINO_ESP32_DEV) || defined(ARDUINO_ARCH_ESP32)
@@ -130,6 +136,8 @@ const char compile_date[] = __DATE__ " " __TIME__;
 #  define DEFAULT_PIN_TXD GPIO_NUM_16
 #  define DEFAULT_PIN_RXD GPIO_NUM_15
 #  define DEFAULT_PIN_SD_CS GPIO_NUM_14
+# elif defined(O1NEXT_BOARD)             /* the O1NEXT WiFi COMM PAC -- profile in o1next.h (#330) */
+#  include "o1next.h"
 # else                                    /* Configuration for standard ESP32 4 & 8MB boards */
 #  define DEFAULT_PIN_DCD GPIO_NUM_14
 #  define DEFAULT_PIN_CTS GPIO_NUM_13
