@@ -1,0 +1,90 @@
+name: build
+
+# A firmware image, on every change to the sketch.
+#
+# Why this workflow lives in the fork rather than in the o1next repository, where
+# every other workflow for this project lives: **the trigger has to be a push to
+# THIS repository.**  A job over there could only ever build a pinned ref, which
+# answers "did the pin build once" -- not "does what was just pushed build",
+# which is the question this exists to answer.
+#
+# It runs exactly one thing, tools/build-o1next.sh, which is also what a person
+# runs.  That is deliberate: CI and the documented recipe cannot drift apart if
+# they are the same command.
+#
+# The artifact is ONE image, flashable at 0x0.  Arduino's own build leaves three
+# binaries plus a fourth from the core, and flashing them means getting four
+# offsets right.  The script merges them and then CHECKS the offsets against the
+# partition table the build just produced, rather than trusting them -- a wrong
+# app offset merges cleanly and does not boot.
+
+on:
+  push:
+    branches: [ o1next ]
+    paths:
+      - 'zimodem/**'
+      - 'tools/build-o1next.sh'
+      - '.github/workflows/build.yml'
+  pull_request:
+    branches: [ o1next ]
+    paths:
+      - 'zimodem/**'
+      - 'tools/build-o1next.sh'
+      - '.github/workflows/build.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  firmware:
+    name: ESP32-S2 firmware image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      # Pinned to the CLI the build was verified with.  arduino-cli's behaviour
+      # changes between majors, and a floating CLI would make this job a
+      # different job every few months.
+      - name: Install arduino-cli
+        uses: arduino/setup-arduino-cli@v2
+        with:
+          version: 1.5.1
+
+      # The core is the whole cost of a cold run -- a couple of minutes and a lot
+      # of megabytes -- so it is cached on the exact version.  The version is
+      # pinned, so the key cannot go stale: a cache miss is slow, never wrong.
+      - name: Cache the ESP32 core
+        uses: actions/cache@v5
+        with:
+          path: ~/.arduino15
+          key: arduino-${{ runner.os }}-esp32-2.0.17
+
+      - name: Install the ESP32 core
+        run: |
+          arduino-cli config init --overwrite
+          arduino-cli config add board_manager.additional_urls \
+            https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+          arduino-cli core update-index
+          arduino-cli core install esp32:esp32@2.0.17
+
+      - name: Build, merge and verify
+        run: tools/build-o1next.sh
+
+      - name: shellcheck the build script
+        run: shellcheck -S warning tools/build-o1next.sh
+
+      - name: Upload the firmware
+        uses: actions/upload-artifact@v7
+        with:
+          name: o1next-wifi-comm-pac-firmware
+          if-no-files-found: error
+          path: |
+            build/o1next-s2/zimodem-o1next-merged.bin
+            build/o1next-s2/zimodem.ino.bin
+            build/o1next-s2/zimodem.ino.bootloader.bin
+            build/o1next-s2/zimodem.ino.partitions.bin
+            build/o1next-s2/zimodem.ino.elf
+            build/o1next-s2/SHA256SUMS
+            build/o1next-s2/BUILD-INFO.txt
