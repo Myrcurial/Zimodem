@@ -260,6 +260,10 @@ def main():
         sys.stderr.write("==   %-5s http://%s:%d/%s\n"
                          % (ifname, addr, args.port, name))
     sys.stderr.write("== give the board the address on the interface it can reach.\n")
+    sys.stderr.write("== if the board cannot reach this: look for a macOS prompt asking whether\n"
+                     "   %s may accept incoming connections.  An unanswered one\n"
+                     "   hangs the connection with nothing in any log.\n"
+                     % os.path.basename(sys.executable))
     sys.stderr.flush()
 
     thread = threading.Thread(target=server.serve_forever, daemon=True)

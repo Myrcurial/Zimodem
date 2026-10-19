@@ -28,11 +28,15 @@ are watching is a 1 MB transfer.
 
 TWO THINGS THIS MACHINE IMPOSES, both measured rather than assumed
 
-  - **The application firewall drops incoming connections** unless the listening
-    binary is one it allows. It auto-allows built-in signed software, so run this
-    with **/usr/bin/python3** (Apple-signed): with the Homebrew python3 the same
-    file and port answer a curl from loopback and *hang* from anywhere else, with
-    nothing in any log to say why.
+  - **The application firewall *asks*, and an unanswered question looks like a block.**
+    The first time a new binary accepts an incoming connection, macOS asks the operator
+    whether it may; until that is answered (and if it is denied) connections to the
+    port *hang* -- loopback serves, the interface address times out, and nothing in any
+    log says why.  Built-in signed binaries are exempt, so /usr/bin/python3 never
+    prompts while a Homebrew python3 does.  Answer the prompt, or add the binary with
+    `sudo socketfilterfw --add` and `--unblockapp`; `socketfilterfw --listapps` shows
+    who has been allowed.  This harness prints the hint at startup, because a hang with
+    no message is the worst shape a failure can have.
   - **SSH here is key auth only.** sshd started as a normal user cannot read the
     shadow file, so password authentication cannot work -- which is fine for #321,
     whose work is key auth, and is a real limit for testing upstream's
@@ -431,6 +435,10 @@ def main():
         note("-", "ssh key: %s", ssh.clientkey)
         note("-", "  %-9s  %s", "", ssh.command())
     note("-", "serving (ctrl-c to stop)")
+    note("-", "if the board cannot reach this: look for a macOS prompt asking whether %s",
+         os.path.basename(sys.executable))
+    note("-", "  may accept incoming connections.  An unanswered one hangs the connection")
+    note("-", "  with nothing in any log.  `socketfilterfw --listapps` shows the answer.")
 
     try:
         while True:
