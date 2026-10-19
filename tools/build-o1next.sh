@@ -28,8 +28,7 @@ set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/.." && pwd)
 
-FQBN=${FQBN:-'esp32:esp32:esp32s2:PartitionScheme=huge_app'}
-CORE_VERSION=2.0.17
+FQBN=${FQBN:-'esp32:esp32:esp32s2:PartitionScheme=min_spiffs,CDCOnBoot=cdc'}
 SKETCH="$root/zimodem"
 BUILD="$root/build/o1next-s2"
 
@@ -39,47 +38,10 @@ MAX_APP_PERCENT=${MAX_APP_PERCENT:-90}
 clean=no
 [ "${1:-}" = "--clean" ] && clean=yes
 
-say() { printf '%s\n' "$*" >&2; }
-die() { say "build-o1next.sh: $*"; exit 1; }
-
-command -v arduino-cli >/dev/null 2>&1 || \
-    die "no arduino-cli -- see REQUIREMENTS.md in the o1next repository"
-command -v python3 >/dev/null 2>&1 || \
-    die "no python3 -- the partition table is read back with the core's gen_esp32part.py"
-
-data=$(arduino-cli config get directories.data 2>/dev/null | tr -d '"')
-[ -n "$data" ] || die "arduino-cli would not say where its data directory is"
-
-platform="$data/packages/esp32/hardware/esp32/$CORE_VERSION"
-[ -d "$platform" ] || die "the esp32 core $CORE_VERSION is not installed --\
- arduino-cli core install esp32:esp32@$CORE_VERSION"
-
-# esptool is a Mach-O binary on macOS and a Python script on Linux, and the core's
-# own platform.txt makes the same distinction (tools.esptool_py.cmd vs .cmd.linux)
-# -- so this is the same rule rather than an invention.
-#
-# `-f` as well as `-x`, and that is not pedantry: on Linux the package ships an
-# `esptool/` *directory* (the Python package) beside `esptool.py`, and `[ -x ]` is
-# true for a directory, so the first version of this picked the directory and
-# failed with "Permission denied" on a runner.  Only a regular executable file
-# will do.
-esptool_bin=""
-esptool_py=""
-for d in "$data"/packages/esp32/tools/esptool_py/*/; do
-    if [ -f "$d/esptool" ] && [ -x "$d/esptool" ]; then esptool_bin="$d/esptool"; break; fi
-    if [ -f "$d/esptool.py" ]; then esptool_py="$d/esptool.py"; break; fi
-done
-if [ -z "$esptool_bin" ] && [ -z "$esptool_py" ]; then
-    die "no esptool in the esp32 core -- is the core installation complete?"
-fi
-
-esptool() {
-    if [ -n "$esptool_bin" ]; then
-        "$esptool_bin" "$@"
-    else
-        python3 "$esptool_py" "$@"
-    fi
-}
+# The toolchain discovery, the esptool rule and the output helpers are shared
+# with tools/flash-o1next.sh, so they live in one file.
+# shellcheck source=o1next-env.sh
+. "$here/o1next-env.sh"
 
 if [ "$clean" = yes ]; then
     rm -rf "$BUILD"
@@ -218,7 +180,7 @@ say "== checksums and build info"
     echo "built:           $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
     echo "git:             $(cd "$root" && git describe --always --dirty 2>/dev/null || echo 'not a git tree')"
     echo "arduino-cli:     $(arduino-cli version 2>/dev/null | head -1)"
-    echo "esp32 core:      $CORE_VERSION"
+    echo "esp32 core:      $O1NEXT_CORE_VERSION"
     echo "fqbn:            $FQBN"
     echo "mcu:             $mcu"
     echo "flash:           mode $flash_mode, freq $flash_freq, size $flash_size"

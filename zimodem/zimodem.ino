@@ -149,6 +149,22 @@ const char compile_date[] = __DATE__ " " __TIME__;
 #  define DEFAULT_PIN_DTR GPIO_NUM_27
 # endif
 # define debugPrintf DBSerial.printf
+# if defined(O1NEXT_BOARD) && ARDUINO_USB_CDC_ON_BOOT
+/* MODIFIED by the o1next project (#330, part of #56).  Apache-2.0 section 4(b).
+ *
+ * The O1NEXT board's console is its USB-C port: the module's UART0 (GPIO43/44) is
+ * not brought out to a connector and the board has no UART bridge.  So with
+ * CDCOnBoot=cdc in the FQBN the debug stream goes to the native USB CDC as well
+ * as to UART0 -- both, not either, because a board that does bring UART0 out
+ * still wants it.  Without the flag this block is skipped and `Serial` is UART0.
+ *
+ * It is not only a convenience: a firmware that never enumerates USB can only be
+ * re-flashed by holding BOOT through a reset, which is a poor property for a
+ * device whose USB port is documented as being for programming. */
+#  undef debugPrintf
+#  define debugPrintf(...) do { o1next_usb_ready(); DBSerial.printf(__VA_ARGS__); \
+                                Serial.printf(__VA_ARGS__); } while(0)
+# endif
 # define SerialConfig uint32_t
 # define UART_CONFIG_MASK 0x8000000
 # define UART_NB_BIT_MASK      0B00001100 | UART_CONFIG_MASK
@@ -252,8 +268,29 @@ class ZMode
 static WiFiClientNode *conns = null;
 static WiFiServerNode *servs = null;
 static PhoneBookEntry *phonebook = null;
-static bool pinSupport[MAX_PIN_NO];
-static int pinCache[MAX_PIN_NO];
+/* MODIFIED by the o1next project (#330, part of #56): these two declarations
+ * only -- all fifty-nine uses are unchanged.  Apache-2.0 section 4(b).
+ *
+ * Both arrays are indexed by pin number, and a board profile says "not
+ * fitted" with -1: upstream's own S3 and ESP8266 branches do it, and so does
+ * the O1NEXT profile, for the six handshake lines the Osborne's DE-9 does not
+ * carry.  So pinSupport[-1] and pinCache[-1] are read on those boards, out of
+ * bounds -- and what the byte before the array happens to hold then decides
+ * whether an unconnected line gets a pinMode(-1) and a pinCache[-1] write.
+ *
+ * Both arrays therefore carry one slot of padding on each side and the names
+ * point into them, so index -1 is a real element that is always zero and the
+ * writes are unreachable.  The high padding is for the several bounds checks
+ * upstream writes as `<= MAX_PIN_NO`, where the last valid index is
+ * MAX_PIN_NO-1.
+ *
+ * What this deliberately does NOT do is make pinMode(-1)/digitalRead(-1)
+ * meaningful: the core takes those as a uint8_t and rejects 255 itself, which
+ * is the right place for that check. */
+static bool pinSupportStorage[MAX_PIN_NO + 2];
+static bool * const pinSupport = &pinSupportStorage[1];
+static int pinCacheStorage[MAX_PIN_NO + 2];
+static int * const pinCache = &pinCacheStorage[1];
 static String termType = DEFAULT_TERMTYPE;
 static String busyMsg = DEFAULT_BUSYMSG;
 static bool debugUart = false;
