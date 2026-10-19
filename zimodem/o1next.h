@@ -128,4 +128,9 @@ static void o1next_usb_ready(void)
     }
 }
 
+/* The read half of that console: the commands, in o1next_console.ino (#334).
+ * Declared here so zimodem.ino's loop() can call it without depending on the
+ * prototypes Arduino generates. */
+#include "o1next_console.h"
+
 #endif /* O1NEXT_H */
