@@ -48,6 +48,16 @@
    strap: the strap is the obvious answer and it was measured not to work, so the
    comment on the command carries that measurement rather than a repetition of it
    here.
+
+   AND `update` IS THE OTHER ONE
+
+   A board with no auto-reset circuit and no button can only be re-flashed if the
+   running firmware can reach the ROM -- and the better answer is not to need the
+   ROM at all.  The second slot has existed since the partition scheme changed to
+   `min_spiffs`, and nothing used it.  `update` uses it: the application image
+   arrives on this console, goes into the INACTIVE slot, is verified there, and
+   the board reboots into it.  No cable moved, no button, no download mode.
+   `bootloader` is what is still there if the new image does not come up.
 */
 
 #include "o1next_console.h"
@@ -56,6 +66,7 @@
 
 #include <ctype.h>
 #include <string.h>
+#include <Update.h>          /* the OTA path below: begin/write/end, and the slot */
 #include <esp_mac.h>
 #include <esp_ota_ops.h>
 #include <esp_partition.h>
@@ -69,9 +80,9 @@
 #define O1NEXT_CONSOLE_LINE_MAX 64
 
 static char   o1nextConsoleLine[O1NEXT_CONSOLE_LINE_MAX];
-static size_t o1nextConsoleLen   = 0;
-static bool   o1nextConsoleFull  = false; /* this line overflowed; drop it */
-static bool   o1nextConsoleAtEOL = false; /* a terminator was the last thing seen */
+static size_t o1nextConsoleLen      = 0;
+static bool   o1nextConsoleFull     = false; /* this line overflowed; drop it */
+static char   o1nextConsoleLastTerm = 0;     /* the last terminator seen, else 0 */
 
 /* Plain literals, no F(): on the ESP32 a string literal is already in flash and
  * F() is a cast, so it buys nothing -- and Print::printf() takes a const char*,
@@ -223,34 +234,178 @@ static void o1nextConsoleBootloader(void)
 
 /* ------------------------------------------------------------------- update --
  *
- * The hook, and deliberately nothing more yet.  The second slot is real and
- * empty, the artifact is the application .bin rather than the merged image, and
- * the path is: write the incoming image to the INACTIVE slot, then reboot into
- * it -- which needs no cable, no button and no download mode (#334, item 2).
+ * The second slot, used.  The path is the one #334 asked for: write the incoming
+ * image to the INACTIVE slot, verify it, point otadata at it, reboot into it --
+ * no cable moved, no button, no download mode.  `bootloader` above is the other
+ * half of that story: it is what is left when the new image does not come up.
  *
- * Saying so out loud is the point of the command existing now: `update` is a
- * reserved word with a known answer, not a word that might mean something.
+ * THE ARTIFACT IS THE APPLICATION .bin -- zimodem.ino.bin, about a megabyte --
+ * and NOT the merged image.  The merged image carries a bootloader and a
+ * partition table, and an OTA must never write those: they are what is doing the
+ * writing, and the slot it writes into is an application slot.
+ *
+ * THE PROTOCOL IS ONE ACKNOWLEDGEMENT BYTE PER CHUNK, and that is not decoration.
+ * The USB CDC's receive queue is 256 bytes deep (USBCDC.cpp -- the default in
+ * setRxBufferSize), and a flash write stalls this loop for tens of milliseconds
+ * while a 4 KB sector is erased: long enough for hundreds of bytes to arrive with
+ * nowhere to go, and an overflowed queue drops them silently.  So the sender waits
+ * for one byte per chunk and is therefore never more than one chunk ahead, and
+ * while the flash is being written the sender is idle and the queue is empty.
+ * The acknowledgement IS the progress -- '.' per chunk, and nothing else is
+ * printed during a transfer, so a sender can count them.
+ *
+ * A FAILED TRANSFER IS NOT A BRICK.  Update.end() verifies the image before it
+ * touches otadata, so a truncated or corrupted one is refused and the running
+ * slot keeps running -- which is why every failure message here says so.
  */
-static void o1nextConsoleUpdate(void)
-{
-    const esp_partition_t *next = esp_ota_get_next_update_partition(NULL);
+#define O1NEXT_OTA_CHUNK 4096u          /* one flash sector: SPI_FLASH_SEC_SIZE */
+#define O1NEXT_OTA_TIMEOUT_MS 5000u     /* per chunk, so a dead sender ends it */
 
-    Serial.print("\r\nupdate: no image being received -- this is the hook, not the path yet.\r\n");
-    if (next != NULL)
-        Serial.printf("        an image would go to %s at 0x%06x (%u bytes),\r\n"
-                      "        then the board would reboot into it.\r\n",
-                      next->label, (unsigned)next->address, (unsigned)next->size);
-    else
-        Serial.print("        there is no inactive slot to write to.\r\n");
-    Serial.print("        the artifact is zimodem.ino.bin, the application alone --\r\n"
-                 "        not the merged image.  Until this lands, a new image goes\r\n"
-                 "        in over USB with tools/flash-o1next.sh.\r\n");
+/* Read up to `want` bytes, and give up if nothing arrives for the timeout.
+ * Bounded on purpose: a sender that dies mid-transfer has to end the update
+ * rather than park the modem in a receive loop forever.
+ *
+ * USBCDC::read() returns -1 as a size_t when the port is not open (see its own
+ * source), which is SIZE_MAX by the time anything is added to it -- so the result
+ * is checked against what was asked for, not just against zero. */
+static size_t o1nextOtaReadChunk(uint8_t *buf, size_t want)
+{
+    size_t        got  = 0;
+    unsigned long last = millis();
+
+    while (got < want) {
+        size_t n = Serial.read(buf + got, want - got);
+
+        if (n > 0 && n <= (want - got)) {
+            got += n;
+            last = millis();
+            continue;
+        }
+        if (millis() - last > O1NEXT_OTA_TIMEOUT_MS)
+            break;
+        delay(1);                       /* let the USB task refill the queue */
+    }
+    return got;
 }
+/* Receive `size` bytes of application image into the inactive slot.  Returns true
+ * only when the image is written AND verified AND otadata points at it; the caller
+ * then reboots into it.  False leaves the board exactly as it was. */
+static bool o1nextOtaReceive(size_t size)
+{
+    static uint8_t chunk[O1NEXT_OTA_CHUNK];
+    size_t left   = size;
+    size_t chunks = 0;
+
+    if (!Update.begin(size)) {
+        Serial.printf("\r\nupdate failed: %s\r\n", Update.errorString());
+        return false;
+    }
+
+    Serial.printf("\r\nready: send %u bytes in %u-byte chunks, one ack byte each\r\n",
+                  (unsigned)size, (unsigned)O1NEXT_OTA_CHUNK);
+    Serial.flush();
+
+    while (left > 0) {
+        size_t want = (left < sizeof(chunk)) ? left : sizeof(chunk);
+        size_t got  = o1nextOtaReadChunk(chunk, want);
+
+        if (got != want) {
+            Update.abort();
+            Serial.printf("\r\nupdate failed: %u of %u bytes of a chunk arrived in %u ms\r\n"
+                          "        nothing was switched; the running slot is untouched\r\n",
+                          (unsigned)got, (unsigned)want, (unsigned)O1NEXT_OTA_TIMEOUT_MS);
+            return false;
+        }
+        if (Update.write(chunk, want) != want) {
+            /* Read the reason BEFORE aborting: abort() overwrites it. */
+            const char *why = Update.errorString();
+            Update.abort();
+            Serial.printf("\r\nupdate failed: %s after %u bytes\r\n"
+                          "        nothing was switched; the running slot is untouched\r\n",
+                          why, (unsigned)(size - left));
+            return false;
+        }
+        left -= want;
+        chunks++;
+        Serial.write('.');              /* the acknowledgement, and the progress */
+    }
+
+    Serial.printf("\r\n%u bytes in %u chunks, verifying\r\n",
+                  (unsigned)size, (unsigned)chunks);
+
+    if (!Update.end(true)) {
+        Serial.printf("update failed: %s -- the running slot is untouched\r\n",
+                      Update.errorString());
+        return false;
+    }
+
+    Serial.print("update ok: written, verified, and otadata now points at it\r\n");
+    Serial.flush();
+    return true;
+}
+
+/* `update` with no argument explains itself; with one, the argument is the size of
+ * the image about to arrive.  The size is not a nicety: Update.begin() needs it to
+ * refuse an image that cannot fit BEFORE a byte is written, and the sender needs
+ * the board to agree before it starts pushing a megabyte. */
+static void o1nextConsoleUpdate(const char *arg)
+{
+    const esp_partition_t *target = esp_ota_get_next_update_partition(NULL);
+    size_t                 size   = 0;
+
+    if (target == NULL) {
+        Serial.print("\r\nupdate: there is no inactive slot to write to.\r\n");
+        return;
+    }
+
+    if (arg == NULL || *arg == '\0') {
+        Serial.printf("\r\nupdate: give it the size of the image in bytes: `update <bytes>`.\r\n"
+                      "        the inactive slot is %s at 0x%06x, %u bytes.\r\n"
+                      "        the artifact is zimodem.ino.bin, the application alone --\r\n"
+                      "        not the merged image.  tools/update-o1next.py sends it.\r\n",
+                      target->label, (unsigned)target->address, (unsigned)target->size);
+        return;
+    }
+
+    for (const char *p = arg; *p != '\0'; p++) {
+        if (*p < '0' || *p > '9') {
+            Serial.printf("\r\nupdate: '%s' is not a number of bytes.\r\n", arg);
+            return;
+        }
+        if (size > 0x4000000u) {        /* larger than any slot on this part */
+            Serial.print("\r\nupdate: that size is not an image this board could hold.\r\n");
+            return;
+        }
+        size = size * 10 + (size_t)(*p - '0');
+    }
+
+    if (size == 0) {
+        Serial.print("\r\nupdate: zero bytes is not an image.\r\n");
+        return;
+    }
+    if (size > target->size) {
+        Serial.printf("\r\nupdate: %u bytes will not fit in %s, which is %u bytes.\r\n",
+                      (unsigned)size, target->label, (unsigned)target->size);
+        return;
+    }
+
+    if (!o1nextOtaReceive(size))
+        return;                         /* the console stays alive, and so does the board */
+
+    /* The image is in the inactive slot, verified, and otadata points at it: this
+     * is the moment to be running it rather than talking about it.  The delay is
+     * for the host to read the line above before the port goes away. */
+    delay(100);
+    esp_restart();
+}
+
+
 
 /* --------------------------------------------------------------------- help --
  *
- * A console with no help is a guessing game, and the bootloader case is the one
- * worth a sentence: it is the reason this file exists before the OTA path does.
+ * A console with no help is a guessing game.  `bootloader` gets a sentence because
+ * it is the one whose mechanism is not guessable, and `update` because it has a
+ * protocol a sender has to match.
  */
 static void o1nextConsoleHelp(void)
 {
@@ -261,7 +416,9 @@ static void o1nextConsoleHelp(void)
         "  bootloader  force the ROM's download mode and reset -- no button.  On a\r\n"
         "              board with no auto-reset circuit -- ours -- this is the only\r\n"
         "              way back to a flash tool.\r\n"
-        "  update      the OTA hook; nothing is received yet (#334, item 2)\r\n"
+        "  update <n>  receive an application image of <n> bytes on this console,\r\n"
+        "              write it to the inactive slot, verify it there, and reboot\r\n"
+        "              into it.  tools/update-o1next.py does the sending.\r\n"
         "  help        this\r\n"
         "\r\n"
         "  The console is the USB CDC.  The O1 side is UART1 (GPIO15/16) and is\r\n"
@@ -279,12 +436,29 @@ static void o1nextConsoleHelp(void)
 static void o1nextConsoleRun(void)
 {
     char *cmd = o1nextConsoleLine;
+    char *arg = NULL;
 
     while (*cmd == ' ' || *cmd == '\t')
         cmd++;
 
+    /* Fold case, then split off the first argument.  The command is
+     * case-insensitive -- a console typed at through a serial monitor should not
+     * fail on shift -- and the argument is left exactly as typed, because it is a
+     * byte count today and a URL tomorrow. */
     for (char *p = cmd; *p != '\0'; p++)
         *p = (char)tolower((unsigned char)*p);
+
+    for (char *p = cmd; *p != '\0'; p++) {
+        if (*p == ' ' || *p == '\t') {
+            *p  = '\0';
+            arg = p + 1;
+            while (*arg == ' ' || *arg == '\t')
+                arg++;
+            if (*arg == '\0')
+                arg = NULL;
+            break;
+        }
+    }
 
     if (*cmd == '\0')
         return;
@@ -295,7 +469,7 @@ static void o1nextConsoleRun(void)
     else if (!strcmp(cmd, "bootloader"))
         o1nextConsoleBootloader();
     else if (!strcmp(cmd, "update"))
-        o1nextConsoleUpdate();
+        o1nextConsoleUpdate(arg);
     else if (!strcmp(cmd, "help") || !strcmp(cmd, "?"))
         o1nextConsoleHelp();
     else
@@ -325,11 +499,22 @@ void o1nextConsolePoll(void)
     {
         if (c == '\r' || c == '\n')
         {
-            /* A terminal sends CRLF; that is one line, not a line and an empty
-             * one, so the terminator that follows another is not a new line. */
-            if (o1nextConsoleAtEOL)
+            /* A terminal sends CRLF, and that is one line rather than a line and
+             * an empty one -- so a terminator is swallowed only when it is the
+             * OTHER one from the one that just ended a line.
+             *
+             * Not pedantry, and not what this did first: "a terminator that
+             * follows a terminator is not a new line" also swallows a bare CR sent
+             * to ask for a prompt, so pressing Enter after a command printed
+             * nothing at all.  Measured, by tools/update-o1next.py, which asks for
+             * a prompt exactly that way.  Two Enters are two lines and both get a
+             * prompt; CRLF is one line. */
+            if (o1nextConsoleLastTerm != 0 && c != o1nextConsoleLastTerm)
+            {
+                o1nextConsoleLastTerm = 0;
                 continue;
-            o1nextConsoleAtEOL = true;
+            }
+            o1nextConsoleLastTerm = (char)c;
 
             Serial.print("\r\n");
             if (o1nextConsoleFull)
@@ -348,7 +533,7 @@ void o1nextConsolePoll(void)
             continue;
         }
 
-        o1nextConsoleAtEOL = false;
+        o1nextConsoleLastTerm = 0;
 
         if (c == 0x7f || c == 0x08)          /* delete / backspace */
         {
