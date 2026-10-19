@@ -54,13 +54,19 @@ platform="$data/packages/esp32/hardware/esp32/$CORE_VERSION"
 [ -d "$platform" ] || die "the esp32 core $CORE_VERSION is not installed --\
  arduino-cli core install esp32:esp32@$CORE_VERSION"
 
-# esptool is a Mach-O binary on macOS and a Python script on Linux, and the
-# core's own platform.txt makes the same distinction -- so this is the same rule
-# rather than an invention.
+# esptool is a Mach-O binary on macOS and a Python script on Linux, and the core's
+# own platform.txt makes the same distinction (tools.esptool_py.cmd vs .cmd.linux)
+# -- so this is the same rule rather than an invention.
+#
+# `-f` as well as `-x`, and that is not pedantry: on Linux the package ships an
+# `esptool/` *directory* (the Python package) beside `esptool.py`, and `[ -x ]` is
+# true for a directory, so the first version of this picked the directory and
+# failed with "Permission denied" on a runner.  Only a regular executable file
+# will do.
 esptool_bin=""
 esptool_py=""
 for d in "$data"/packages/esp32/tools/esptool_py/*/; do
-    if [ -x "$d/esptool" ]; then esptool_bin="$d/esptool"; break; fi
+    if [ -f "$d/esptool" ] && [ -x "$d/esptool" ]; then esptool_bin="$d/esptool"; break; fi
     if [ -f "$d/esptool.py" ]; then esptool_py="$d/esptool.py"; break; fi
 done
 if [ -z "$esptool_bin" ] && [ -z "$esptool_py" ]; then
