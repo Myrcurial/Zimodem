@@ -13,6 +13,18 @@
    See the License for the specific language governing permissions and
    limitations under the License.
 */
+/*
+ * MODIFIED by the o1next project (#334, part of #56): reSaveConfig moved from
+ * private to public.  Apache-2.0 section 4(b).
+ *
+ * It is the only thing that writes the config file, and it was private, which
+ * meant nothing outside this class could save one -- so the console (a second
+ * front end to the same config, on the USB port rather than the O1 side) could
+ * set a network but not remember it.  The alternative was a file of its own,
+ * and two places that can hold an SSID is how a board ends up on the wrong
+ * network.  Visibility only: no behaviour changed.
+ */
+
 
 const int MAX_COMMAND_SIZE=256;
 static const char *CONFIG_FILE_OLD = "/zconfig.txt";
@@ -166,7 +178,6 @@ class ZCommand : public ZMode
     void setConfigDefaults();
     void parseConfigOptions(String configArguments[]);
     void setOptionsFromSavedConfig(String configArguments[]);
-    bool reSaveConfig(int retries);
     void setAltOpModeAdjustments();
     int pinStatusDecoder(int pinActive, int pinInactive);
     int getStatusRegister(const int snum, int crc8);
@@ -216,6 +227,7 @@ class ZCommand : public ZMode
 
     ZCommand();
     void loadConfig();
+    bool reSaveConfig(int retries); /* o1next: public, see the notice above */
 
     FlowControlType getFlowControlType();
     int getConfigFlagBitmap();

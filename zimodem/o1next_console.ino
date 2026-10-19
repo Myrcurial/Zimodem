@@ -58,6 +58,15 @@
    arrives on this console, goes into the INACTIVE slot, is verified there, and
    the board reboots into it.  No cable moved, no button, no download mode.
    `bootloader` is what is still there if the new image does not come up.
+
+   AND THE NETWORK IS WHAT MAKES IT REMOTE
+
+   `update <url>` fetches that same image over HTTP, and `update-at-boot <url>`
+   arms one fetch for the next boot -- so an update can happen with nothing plugged
+   into the board at all.  `wifi` joins a network and saves it, through the same
+   config file the modem's own AT commands write: a board on a bench has no machine
+   on the O1 side to configure it with, and two places that can hold an SSID is how
+   a board ends up on the wrong network.
 */
 
 #include "o1next_console.h"
@@ -287,19 +296,47 @@ static size_t o1nextOtaReadChunk(uint8_t *buf, size_t want)
     }
     return got;
 }
+/* The image lands here a sector at a time, whichever way it arrives.  One buffer
+ * for both feeders: they never run at the same time, and 4 KB of RAM is 4 KB. */
+static uint8_t o1nextOtaBuf[O1NEXT_OTA_CHUNK];
+
+/* The slot checks and Update.begin(), shared by both feeders.  This is what refuses
+ * an image that cannot fit the inactive slot BEFORE a byte is written. */
+static bool o1nextOtaPrepare(size_t size)
+{
+    if (!Update.begin(size)) {
+        Serial.printf("\r\nupdate failed: %s\r\n", Update.errorString());
+        return false;
+    }
+    return true;
+}
+
+/* Verify, and only then point otadata at the new slot.  Every failure leaves the
+ * running slot running, which is why both feeders end here and not at
+ * esp_ota_set_boot_partition(). */
+static bool o1nextOtaFinish(void)
+{
+    if (!Update.end(true)) {
+        Serial.printf("update failed: %s -- the running slot is untouched\r\n",
+                      Update.errorString());
+        return false;
+    }
+    Serial.print("update ok: written, verified, and otadata now points at it\r\n");
+    Serial.flush();
+    return true;
+}
+
 /* Receive `size` bytes of application image into the inactive slot.  Returns true
  * only when the image is written AND verified AND otadata points at it; the caller
  * then reboots into it.  False leaves the board exactly as it was. */
 static bool o1nextOtaReceive(size_t size)
 {
-    static uint8_t chunk[O1NEXT_OTA_CHUNK];
-    size_t left   = size;
-    size_t chunks = 0;
+    uint8_t *chunk = o1nextOtaBuf;
+    size_t   left  = size;
+    size_t   chunks = 0;
 
-    if (!Update.begin(size)) {
-        Serial.printf("\r\nupdate failed: %s\r\n", Update.errorString());
+    if (!o1nextOtaPrepare(size))
         return false;
-    }
 
     Serial.printf("\r\nready: send %u bytes in %u-byte chunks, one ack byte each\r\n",
                   (unsigned)size, (unsigned)O1NEXT_OTA_CHUNK);
@@ -333,15 +370,7 @@ static bool o1nextOtaReceive(size_t size)
     Serial.printf("\r\n%u bytes in %u chunks, verifying\r\n",
                   (unsigned)size, (unsigned)chunks);
 
-    if (!Update.end(true)) {
-        Serial.printf("update failed: %s -- the running slot is untouched\r\n",
-                      Update.errorString());
-        return false;
-    }
-
-    Serial.print("update ok: written, verified, and otadata now points at it\r\n");
-    Serial.flush();
-    return true;
+    return o1nextOtaFinish();
 }
 
 /* `update` with no argument explains itself; with one, the argument is the size of
@@ -353,16 +382,28 @@ static void o1nextConsoleUpdate(const char *arg)
     const esp_partition_t *target = esp_ota_get_next_update_partition(NULL);
     size_t                 size   = 0;
 
+    /* A URL is the other way in, and it is the one that needs no cable: the board
+     * does the fetching. */
+    if (arg != NULL && !strncmp(arg, "http://", 7)) {
+        if (o1nextOtaFromUrl(arg)) {
+            delay(100);
+            esp_restart();
+        }
+        return;                         /* the console stays alive on a failure */
+    }
+
     if (target == NULL) {
         Serial.print("\r\nupdate: there is no inactive slot to write to.\r\n");
         return;
     }
 
     if (arg == NULL || *arg == '\0') {
-        Serial.printf("\r\nupdate: give it the size of the image in bytes: `update <bytes>`.\r\n"
+        Serial.printf("\r\nupdate: give it the size of the image in bytes -- `update <bytes>` --\r\n"
+                      "        or a URL to fetch it from: `update http://host:port/file.bin`.\r\n"
                       "        the inactive slot is %s at 0x%06x, %u bytes.\r\n"
                       "        the artifact is zimodem.ino.bin, the application alone --\r\n"
-                      "        not the merged image.  tools/update-o1next.py sends it.\r\n",
+                      "        not the merged image.  tools/update-o1next.py sends it,\r\n"
+                      "        tools/ota-server-o1next.py serves it.\r\n",
                       target->label, (unsigned)target->address, (unsigned)target->size);
         return;
     }
@@ -401,6 +442,332 @@ static void o1nextConsoleUpdate(const char *arg)
 
 
 
+/* -------------------------------------------------------------- the network --
+ *
+ * Three things that only exist because the board can be on a network: joining one,
+ * fetching an image over it, and arming a fetch for the next boot.
+ *
+ * The modem's own AT command set already configures the network -- AT*SSID and
+ * AT*PASS, over the O1 side -- and that is the path a user in the field uses.  But
+ * the O1 side needs a machine on the other end of it, and a board on a bench has
+ * none.  So the console can do it too, and it saves through the SAME config file
+ * (commandMode.reSaveConfig()) so the two front ends cannot end up disagreeing
+ * about which network this board is on.
+ */
+static void o1nextConsoleWifi(const char *arg)
+{
+    const char *sp;
+    String      ssid;
+    String      pw;
+
+    if (arg == NULL || *arg == '\0') {
+        Serial.printf("\r\nwifi: stored ssid is \"%s\"\r\n", wifiSSI.c_str());
+        if (WiFi.status() == WL_CONNECTED) {
+            Serial.printf("      connected to \"%s\", ip %s, gw %s\r\n",
+                          WiFi.SSID().c_str(),
+                          WiFi.localIP().toString().c_str(),
+                          WiFi.gatewayIP().toString().c_str());
+            Serial.printf("      rssi %d dBm, channel %d -- the S2 has a 2.4 GHz radio only\r\n",
+                          WiFi.RSSI(), WiFi.channel());
+        } else
+            Serial.print("      not connected\r\n");
+        return;
+    }
+
+    sp = strchr(arg, ' ');
+    if (sp == NULL) {
+        Serial.print("\r\nwifi: it wants both: `wifi <ssid> <password>`\r\n");
+        return;
+    }
+    ssid = String(arg).substring(0, sp - arg);
+    pw   = String(sp + 1);
+    ssid.trim();
+    pw.trim();
+    if (ssid.length() == 0) {
+        Serial.print("\r\nwifi: an empty ssid is not a network.\r\n");
+        return;
+    }
+
+    wifiSSI = ssid;
+    wifiPW  = pw;
+
+    Serial.printf("\r\nwifi: joining \"%s\"\r\n", wifiSSI.c_str());
+    if (!connectWifi(wifiSSI.c_str(), wifiPW.c_str(), staticIP, staticDNS, staticGW, staticSN)) {
+        Serial.print("      did not connect -- a wrong password, or a network this board\r\n"
+                     "      cannot see: the ESP32-S2 has a 2.4 GHz radio and no other.\r\n"
+                     "      Nothing was saved.\r\n");
+        return;
+    }
+
+    Serial.printf("      connected: ip %s, gw %s, rssi %d dBm, channel %d\r\n",
+                  WiFi.localIP().toString().c_str(),
+                  WiFi.gatewayIP().toString().c_str(),
+                  WiFi.RSSI(), WiFi.channel());
+
+    if (commandMode.reSaveConfig(3))
+        Serial.print("      saved -- it will rejoin this network on the next boot\r\n");
+    else
+        Serial.print("      WARNING: connected, but the config would not save\r\n");
+}
+
+/* -------------------------------------------------------- update over HTTP --
+ *
+ * `update http://host:port/path` -- the image arrives over the network instead of
+ * down this console.  Plain HTTP, and the scheme is checked rather than assumed:
+ * there is no trust store on this board, and an update over an unverified
+ * connection is not a thing to do quietly.
+ *
+ * What it needs from the server, and why the listener on the other end is built to
+ * provide it: a **Content-Length**.  Update.begin(size) wants the size before a
+ * byte is written -- it is what refuses an image that cannot fit the slot -- so a
+ * chunked answer is refused here rather than guessed at.
+ *
+ * The body is streamed 4 KB at a time from the socket into the flash.  Nothing
+ * holds the image in RAM, which is the whole reason this is a loop.
+ *
+ * The same o1nextOtaPrepare()/o1nextOtaFinish() pair the console feeder uses, so
+ * both ways in verify before otadata moves and both fail the same way.
+ */
+static bool o1nextOtaFromUrl(const char *url)
+{
+    WiFiClient    client;
+    String        hostport;
+    String        path = "/";
+    char          host[64];
+    int           port       = 80;
+    size_t        size       = 0;
+    int           status     = 0;
+    unsigned long started;
+    unsigned long lastPrint;
+    size_t        left;
+
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.print("\r\nupdate: this board is not on a network yet.  `wifi <ssid> <password>`\r\n"
+                     "        first, or `wifi` on its own to see what it is holding.\r\n");
+        return false;
+    }
+
+    {
+        const char *p     = url + 7;                /* past "http://" */
+        const char *slash = strchr(p, '/');
+        int         colon;
+
+        hostport = slash ? String(p).substring(0, slash - p) : String(p);
+        if (slash != NULL)
+            path = String(slash);
+
+        colon = hostport.indexOf(':');
+        if (colon >= 0) {
+            port     = hostport.substring(colon + 1).toInt();
+            hostport = hostport.substring(0, colon);
+        }
+        if (hostport.length() == 0 || port <= 0 || port > 65535) {
+            Serial.printf("\r\nupdate: '%s' is not a URL this can fetch.\r\n", url);
+            return false;
+        }
+        hostport.toCharArray(host, sizeof(host));
+    }
+
+    Serial.printf("\r\nupdate: GET http://%s:%d%s\r\n", host, port, path.c_str());
+    if (!client.connect(host, port, 10000)) {
+        Serial.printf("        could not reach %s:%d\r\n", host, port);
+        return false;
+    }
+    client.printf("GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n",
+                  path.c_str(), host);
+    client.setTimeout(10000);
+
+    while (client.connected() || client.available()) {
+        String line = client.readStringUntil('\n');
+
+        line.trim();
+        if (line.length() == 0)
+            break;                                  /* end of the head */
+        if (status == 0) {
+            int first = line.indexOf(' ');
+            status = (first > 0) ? line.substring(first + 1).toInt() : -1;
+            continue;
+        }
+        line.toLowerCase();
+        if (line.startsWith("content-length:"))
+            size = (size_t)line.substring(15).toInt();
+    }
+
+    if (status != 200) {
+        Serial.printf("        the server answered %d, not 200 -- nothing was written\r\n", status);
+        client.stop();
+        return false;
+    }
+    if (size == 0) {
+        Serial.print("        no Content-Length in the answer, so there is no size to give\r\n"
+                     "        Update.begin() -- nothing was written\r\n");
+        client.stop();
+        return false;
+    }
+
+    if (!o1nextOtaPrepare(size)) {
+        client.stop();
+        return false;
+    }
+
+    started   = millis();
+    lastPrint = started;
+    left      = size;
+
+    while (left > 0) {
+        size_t        want   = (left < sizeof(o1nextOtaBuf)) ? left : sizeof(o1nextOtaBuf);
+        size_t        got    = 0;
+        unsigned long waited = millis();
+
+        while (got < want) {
+            if (client.available()) {
+                got += client.read(o1nextOtaBuf + got, want - got);
+                waited = millis();
+                continue;
+            }
+            if (!client.connected())
+                break;
+            if (millis() - waited > 15000)
+                break;
+            delay(1);
+        }
+
+        if (got != want) {
+            Update.abort();
+            Serial.printf("\r\nupdate failed: the connection %s after %u of %u bytes\r\n"
+                          "        nothing was switched; the running slot is untouched\r\n",
+                          (got == 0) ? "stalled" : "ended early",
+                          (unsigned)(size - left), (unsigned)size);
+            client.stop();
+            return false;
+        }
+        if (Update.write(o1nextOtaBuf, want) != want) {
+            const char *why = Update.errorString();   /* read it before abort() */
+            Update.abort();
+            Serial.printf("\r\nupdate failed: %s after %u bytes\r\n"
+                          "        nothing was switched; the running slot is untouched\r\n",
+                          why, (unsigned)(size - left));
+            client.stop();
+            return false;
+        }
+        left -= want;
+
+        /* Progress, and only for a host that is listening: with nobody attached
+         * these writes are no-ops, and on a headless board that is the difference
+         * between an update that takes seconds and one that crawls. */
+        if (Serial && (millis() - lastPrint > 1000)) {
+            Serial.printf("\r        %u of %u bytes", (unsigned)(size - left), (unsigned)size);
+            lastPrint = millis();
+        }
+    }
+    client.stop();
+
+    Serial.printf("\r\n        %u bytes in %u ms\r\n",
+                  (unsigned)size, (unsigned)(millis() - started));
+
+    return o1nextOtaFinish();
+}
+
+/* ------------------------------------------------------- update-at-boot --
+ *
+ * One URL, remembered, fetched once at the next boot.  This is what makes an update
+ * need no cable at all: arm it while the console is attached, then power the board
+ * from anything, and it updates itself and reboots into the new image.
+ *
+ * The URL is cleared only after a fetch that verified, and before the reboot.  So a
+ * board that cannot reach the network keeps the instruction and tries again next
+ * boot, and a board that succeeds does not loop.
+ */
+#define O1NEXT_UPDATE_URL_FILE "/o1next-update.txt"
+
+static void o1nextConsoleUpdateAtBoot(const char *arg)
+{
+    File f;
+
+    if (arg == NULL || *arg == '\0') {
+        if (!SPIFFS.exists(O1NEXT_UPDATE_URL_FILE)) {
+            Serial.print("\r\nupdate-at-boot: nothing armed.\r\n");
+            return;
+        }
+        f = SPIFFS.open(O1NEXT_UPDATE_URL_FILE, "r");
+        if (!f) {
+            Serial.print("\r\nupdate-at-boot: armed, but the file will not open.\r\n");
+            return;
+        }
+        String url = f.readStringUntil('\n');
+        f.close();
+        url.trim();
+        Serial.printf("\r\nupdate-at-boot: armed for \"%s\"\r\n", url.c_str());
+        return;
+    }
+
+    if (!strcmp(arg, "off")) {
+        SPIFFS.remove(O1NEXT_UPDATE_URL_FILE);
+        Serial.print("\r\nupdate-at-boot: disarmed.\r\n");
+        return;
+    }
+    if (strncmp(arg, "http://", 7) != 0) {
+        Serial.print("\r\nupdate-at-boot: it wants an http:// URL, or `off`.\r\n");
+        return;
+    }
+
+    SPIFFS.remove(O1NEXT_UPDATE_URL_FILE);
+    f = SPIFFS.open(O1NEXT_UPDATE_URL_FILE, "w");
+    if (!f) {
+        Serial.print("\r\nupdate-at-boot: could not write it to the filesystem.\r\n");
+        return;
+    }
+    f.printf("%s\n", arg);
+    f.close();
+    Serial.printf("\r\nupdate-at-boot: armed for \"%s\"\r\n"
+                  "        the next boot fetches it once, over the network, with nothing\r\n"
+                  "        plugged in -- and `update-at-boot off` cancels it.\r\n", arg);
+}
+
+/* Once per boot, from the console poll. */
+static void o1nextUpdateAtBootRun(void)
+{
+    String url;
+    File   f;
+    int    i;
+
+    if (!SPIFFS.exists(O1NEXT_UPDATE_URL_FILE))
+        return;
+    f = SPIFFS.open(O1NEXT_UPDATE_URL_FILE, "r");
+    if (!f)
+        return;
+    url = f.readStringUntil('\n');
+    f.close();
+    url.trim();
+    if (url.length() == 0) {
+        SPIFFS.remove(O1NEXT_UPDATE_URL_FILE);
+        return;
+    }
+
+    Serial.printf("\r\nupdate-at-boot: armed for \"%s\"\r\n", url.c_str());
+
+    /* The modem's own boot-time connect has already had its turn -- loadConfig()
+     * blocks while it connects -- so this wait is only for a board that came up
+     * before its access point did.  Bounded, because the instruction survives a
+     * failed attempt: it is cleared only by a fetch that verified. */
+    for (i = 0; (i < 60) && (WiFi.status() != WL_CONNECTED); i++)
+        delay(500);
+
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.print("        no network yet -- still armed, and it will try next boot\r\n");
+        return;
+    }
+    if (!o1nextOtaFromUrl(url.c_str())) {
+        Serial.print("        still armed, and it will try next boot\r\n");
+        return;
+    }
+
+    SPIFFS.remove(O1NEXT_UPDATE_URL_FILE);       /* one shot: cleared before the reboot */
+    Serial.print("        done -- disarmed, and rebooting into it\r\n");
+    delay(200);
+    esp_restart();
+}
+
 /* --------------------------------------------------------------------- help --
  *
  * A console with no help is a guessing game.  `bootloader` gets a sentence because
@@ -412,13 +779,19 @@ static void o1nextConsoleHelp(void)
     Serial.print(
         "\r\ncommands:\r\n"
         "  status      version, pins in use, the running slot, uptime, free heap\r\n"
+        "  wifi        the network: `wifi` reports it, `wifi <ssid> <password>`\r\n"
+        "              joins one and saves it.  2.4 GHz only -- that is the radio.\r\n"
+        "  update <n>  take <n> bytes on this console into the inactive slot,\r\n"
+        "              verify it, and reboot into it.  tools/update-o1next.py sends\r\n"
+        "              it, and the size is what refuses an image that cannot fit.\r\n"
+        "  update <url>  fetch the image over HTTP instead: the board does the work,\r\n"
+        "              the network carries it, and nothing is sent down this port.\r\n"
+        "  update-at-boot <url>|off  arm one fetch for the next boot -- an update\r\n"
+        "              with no cable at all.\r\n"
         "  reboot      esp_restart() -- back into the application\r\n"
         "  bootloader  force the ROM's download mode and reset -- no button.  On a\r\n"
         "              board with no auto-reset circuit -- ours -- this is the only\r\n"
         "              way back to a flash tool.\r\n"
-        "  update <n>  receive an application image of <n> bytes on this console,\r\n"
-        "              write it to the inactive slot, verify it there, and reboot\r\n"
-        "              into it.  tools/update-o1next.py does the sending.\r\n"
         "  help        this\r\n"
         "\r\n"
         "  The console is the USB CDC.  The O1 side is UART1 (GPIO15/16) and is\r\n"
@@ -441,13 +814,10 @@ static void o1nextConsoleRun(void)
     while (*cmd == ' ' || *cmd == '\t')
         cmd++;
 
-    /* Fold case, then split off the first argument.  The command is
-     * case-insensitive -- a console typed at through a serial monitor should not
-     * fail on shift -- and the argument is left exactly as typed, because it is a
-     * byte count today and a URL tomorrow. */
-    for (char *p = cmd; *p != '\0'; p++)
-        *p = (char)tolower((unsigned char)*p);
-
+    /* Split the argument off FIRST, then fold the case of the command word only.
+     * The command should not fail on shift, but an argument has to arrive exactly
+     * as typed: a URL's path is case-sensitive, and so is a wifi password -- and
+     * lowercasing those was a bug this found rather than a nicety. */
     for (char *p = cmd; *p != '\0'; p++) {
         if (*p == ' ' || *p == '\t') {
             *p  = '\0';
@@ -460,6 +830,9 @@ static void o1nextConsoleRun(void)
         }
     }
 
+    for (char *p = cmd; *p != '\0'; p++)
+        *p = (char)tolower((unsigned char)*p);
+
     if (*cmd == '\0')
         return;
     else if (!strcmp(cmd, "status"))
@@ -468,8 +841,12 @@ static void o1nextConsoleRun(void)
         o1nextConsoleReboot();
     else if (!strcmp(cmd, "bootloader"))
         o1nextConsoleBootloader();
+    else if (!strcmp(cmd, "wifi"))
+        o1nextConsoleWifi(arg);
     else if (!strcmp(cmd, "update"))
         o1nextConsoleUpdate(arg);
+    else if (!strcmp(cmd, "update-at-boot"))
+        o1nextConsoleUpdateAtBoot(arg);
     else if (!strcmp(cmd, "help") || !strcmp(cmd, "?"))
         o1nextConsoleHelp();
     else
@@ -491,9 +868,17 @@ static void o1nextConsoleRun(void)
  */
 void o1nextConsolePoll(void)
 {
+    static bool lookedForAnArmedUpdate = false;
     int c;
 
     o1nextConsoleGreet();
+
+    /* The armed one-shot, once per boot.  Here rather than in setup() because it
+     * prints, and because loop() is where this file already lives. */
+    if (!lookedForAnArmedUpdate) {
+        lookedForAnArmedUpdate = true;
+        o1nextUpdateAtBootRun();
+    }
 
     while ((c = Serial.read()) >= 0)
     {
