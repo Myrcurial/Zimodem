@@ -81,9 +81,33 @@ APP_ADDR=0x10000
 # ------------------------------------------------------------------ compile --
 # The output is captured rather than streamed, because two things in it are
 # checked: that the compile succeeded at all, and that the sketch still fits.
+#
+# The log lives BESIDE the build directory, not inside it, and that is not tidiness.
+# arduino-cli REMOVES the build directory when the build options change -- which a
+# new or edited `zimodem/build_opt.h` does -- and it does that *after* this shell has
+# opened the log for writing.  The log vanishes with the directory, the redirect
+# fails, and the failure reads as "the compile failed" with no compiler output at
+# all.  Measured twice, on the first build after a build_opt.h change.
 say "== compiling"
-compile_log="$BUILD/compile.log"
-if ! arduino-cli compile --fqbn "$FQBN" --build-path "$BUILD" "$SKETCH" \
+compile_log="$(dirname "$BUILD")/compile.log"
+# What the board calls itself on a USB port.  The core's descriptor
+# (cores/esp32/USB.cpp) reads USB_MANUFACTURER / USB_PRODUCT / USB_SERIAL, and the
+# defaults are "Espressif Systems" / ARDUINO_BOARD / "0" -- so two of these boards are
+# indistinguishable in `ioreg` and `system_profiler` until one is named.  `USB_SERIAL`
+# cannot be the MAC: the core substitutes __MAC__ only on the S3, and the S2 falls
+# back to "0", so the serial string names the *role* and the MAC stays on the console
+# (see `status`) and on the label somebody writes on the board.
+#
+# These go here rather than in `zimodem/build_opt.h`, and that is measured rather than
+# preferred: build_opt.h is handed to the compiler as a gcc RESPONSE FILE
+# (`"@{build.opt.path}"` in the core's platform.txt), and a response file strips quotes
+# and *then* splits on whitespace -- so `-DUSB_PRODUCT="WiFi COMM PAC"` arrives as the
+# value `WiFi` and two stray arguments, and the build dies with "'WiFi' was not
+# declared in this scope".  Through --build-property the shell does the quoting, and
+# `compiler.cpp.extra_flags` is empty in this platform.txt, so nothing is overridden.
+USB_NAMING=${USB_NAMING:-'-DUSB_MANUFACTURER="o1next" -DUSB_PRODUCT="WiFi-COMM-PAC" -DUSB_SERIAL="o1next-modem"'}
+if ! arduino-cli compile --fqbn "$FQBN" --build-path "$BUILD" \
+        --build-property "compiler.cpp.extra_flags=$USB_NAMING" "$SKETCH" \
         > "$compile_log" 2>&1; then
     cat "$compile_log" >&2
     die "the compile failed -- the output above is the whole of it"
