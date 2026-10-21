@@ -40,9 +40,56 @@
 
 static o1_tone_gen o1nextTone;
 static bool        o1nextSoundUp = false;
-static bool        o1nextMuted   = false;
 static bool        o1nextPlaying = false;
 static int16_t     o1nextBuf[256];
+
+/* -------------------------------------------------------- the speaker, and the
+ * dial that holds a connection back.
+ *
+ * The table -- Hayes' four speaker modes, and how they compose with the `T` in
+ * `ATDT` -- is `o1_sound_policy` in tone.h, where it is host-tested.  This is the
+ * fork's single instance of it.  **There is one policy and one mute**: `Mute` is
+ * the boolean view of `ATM0`, not a second mechanism, because two mutes is
+ * exactly the drift this file's notice warns about.
+ */
+static o1_sound_policy o1nextPolicy;
+static bool           o1nextPolicyReady = false;
+
+/* The dial, and the gate.  `o1_dial_gate` holds the two facts a connection needs
+ * before it is *admitted* -- the tones have finished, and the link is up -- and
+ * they arrive from different places, which is why they are held rather than
+ * inferred.  Either order works: a fast host is waited for, a slow dial is waited
+ * out. */
+static o1_dial_gate o1nextDialGate;
+static o1_dtmf_dial o1nextDial;
+static bool         o1nextDialPlaying = false;
+static char         o1nextDialDigits[O1_DTMF_DIGITS_MAX + 1u];
+
+static void o1nextPolicyInit(void)
+{
+  if(o1nextPolicyReady)
+    return;
+  o1nextPolicyReady = true;
+  o1_sound_policy_init(&o1nextPolicy);   /* M1, and a call that has not asked */
+  o1_dial_gate_reset(&o1nextDialGate);
+}
+
+/* "The sound has stopped" -- and the one place that knows a *dial* has finished,
+ * which is a fact the admission gate is waiting for.
+ *
+ * **Every way a dial can end comes through here**, a mute in the middle of one
+ * included.  That is deliberate: a dial cut short by `ATM0` has still finished,
+ * and a gate left waiting for tones that will never resume would hold the
+ * connection open for the rest of the session. */
+static void o1nextSoundStopped(void)
+{
+  o1nextPlaying = false;
+  if(o1nextDialPlaying)
+  {
+    o1nextDialPlaying = false;
+    o1_dial_gate_dialled(&o1nextDialGate);
+  }
+}
 
 /* The chunk is small on purpose.  `i2s_write` blocks until the DMA queue takes
  * the samples, so a 256-sample chunk is about 16 ms at 16 kHz -- short enough
@@ -59,6 +106,10 @@ bool o1nextSoundBegin(void)
 {
   i2s_config_t     cfg  = {};
   i2s_pin_config_t pins = {};
+
+  /* Before the I2S attempt, not after: the speaker mode has to work -- and has to
+   * be reportable by `ATM` -- even on a board whose amplifier would not install. */
+  o1nextPolicyInit();
 
   cfg.mode                 = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX);
   cfg.sample_rate          = O1_TONE_FS_DEFAULT;
@@ -100,16 +151,16 @@ bool o1nextSoundBegin(void)
 
 void o1nextSoundPlay(const o1_handshake *hs)
 {
+  o1nextPolicyInit();
+
   if((!o1nextSoundUp) || (hs == 0))
     return;
 
-  if(o1nextMuted)
-  {
-    /* Muted means *silent*, not "queued for later" -- so a mute during a
-     * handshake stops the handshake, which is what a mute switch does. */
-    o1nextPlaying = false;
-    return;
-  }
+  /* A new sound replaces the old one -- a dial included, which is therefore
+   * marked finished here too.  This is the primitive; whether a sound should be
+   * made at all is the *policy*, and the policy is asked by the named events
+   * below rather than here, so that there is one answer per event and not two. */
+  o1nextSoundStopped();
 
   o1_tone_start(&o1nextTone, hs, O1_TONE_FS_DEFAULT, O1_TONE_AMP_DEFAULT);
   o1nextPlaying = true;
@@ -123,37 +174,84 @@ void o1nextSoundPlayForRate(uint32_t mbaud)
 
 void o1nextSoundConnect(uint32_t mbaud)
 {
+  o1nextPolicyInit();
+
+  /* M3 is the mode that stops at the dial, and a plain `ATD` never asked. */
+  if(!o1_sound_wants_connect(&o1nextPolicy))
+    return;
+
   o1nextSoundPlayForRate(mbaud);
 }
 
 void o1nextSoundRing(void)
 {
+  o1nextPolicyInit();
+  if(!o1_sound_wants_ring(&o1nextPolicy))
+    return;
   o1nextSoundPlay(&o1_hs_ring);
 }
 
 void o1nextSoundDial(void)
 {
+  /* The exchange's dial tone, on its own.  `ATDT` does **not** use this: the dial
+   * a call makes is its own DTMF fingerprint, and prepending a second of dial
+   * tone to it would be inventing a phase nobody asked for. */
+  o1nextPolicyInit();
+  if(!o1_sound_wants_dial(&o1nextPolicy))
+    return;
   o1nextSoundPlay(&o1_hs_dialtone);
 }
 
 void o1nextSoundDisconnect(void)
 {
+  /* Not a dial, and there is no `T` for it, so the mode alone decides -- and the
+   * mode that says yes is M2, the only one still on after the carrier.  This is
+   * where M1 and M2 part. */
+  o1nextPolicyInit();
+  if(!o1_sound_wants_disconnect(&o1nextPolicy))
+    return;
   o1nextSoundPlay(&o1_hs_disconnect);
+}
+
+/* ---------------------------------------------------------------- the policy */
+
+void o1nextSoundSetMode(o1_speaker m)
+{
+  o1nextPolicyInit();
+  o1_sound_policy_set_mode(&o1nextPolicy, m);
+
+  /* A mute is immediate: silence, not a queue.  A mute switch that lets the
+   * handshake finish first is not a mute switch. */
+  if(m == O1_SPK_OFF)
+  {
+    o1nextSoundStopped();
+    if(o1nextSoundUp)
+      i2s_zero_dma_buffer(I2S_NUM_0);
+  }
+
+  debugPrintf("O1NEXT sound: speaker %s.\r\n", o1_speaker_name(m));
+}
+
+o1_speaker o1nextSoundMode(void)
+{
+  o1nextPolicyInit();
+  return o1_sound_policy_mode(&o1nextPolicy);
+}
+
+const char *o1nextSoundModeName(void)
+{
+  return o1_speaker_name(o1nextSoundMode());
 }
 
 void o1nextSoundMute(bool on)
 {
-  o1nextMuted = on;
-  if(on && o1nextSoundUp)
-  {
-    o1nextPlaying = false;
-    i2s_zero_dma_buffer(I2S_NUM_0);
-  }
+  /* The boolean view of `ATM0` and `ATM1` -- one policy, two ways to say it. */
+  o1nextSoundSetMode(on ? O1_SPK_OFF : O1_SPK_UNTIL_CARRIER);
 }
 
 bool o1nextSoundIsMuted(void)
 {
-  return o1nextMuted;
+  return o1nextSoundMode() == O1_SPK_OFF;
 }
 
 bool o1nextSoundIsPlaying(void)
@@ -179,7 +277,7 @@ void o1nextSoundLoop(void)
   n = o1_tone_render(&o1nextTone, o1nextBuf, O1NEXT_SOUND_CHUNK);
   if(n == 0)
   {
-    o1nextPlaying = false;
+    o1nextSoundStopped();
     debugPrintf("O1NEXT sound: done.\r\n");
     return;
   }
@@ -192,7 +290,121 @@ void o1nextSoundLoop(void)
 
   if(o1_tone_done(&o1nextTone))
   {
-    o1nextPlaying = false;
+    o1nextSoundStopped();
     debugPrintf("O1NEXT sound: done.\r\n");
   }
+}
+
+/* ------------------------------------------------------- the dial, and the gate
+ *
+ * `ATDT <host>` plays the DTMF fingerprint of the connect string, and the
+ * connection is not *admitted* until it has finished -- option (c) of #322.  The
+ * socket, the stream and the machine's own CONNECT are immediate; what waits is
+ * the CD lamp and the `CONNECT` text, because those two are what "the connection
+ * exists" means to everything watching.
+ *
+ * The call order is the shape of the thing:
+ *
+ *     o1nextDialBegin(connect, tones)  before the connect attempt, so the tones
+ *                                      play while the socket comes up
+ *     o1nextDialLinked()               the socket answered
+ *     o1nextDialFailed()               it did not, so there is nothing to wait for
+ *     o1nextDialAdmitted()             both facts in -- `loop()` releases it
+ */
+
+void o1nextDialBegin(const char *connect, bool tones)
+{
+  unsigned n;
+
+  o1nextPolicyInit();
+
+  /* This call's request, from the `T` in `ATDT`.  Set on *every* dial, including
+   * the silent ones, so that a previous call's `T` cannot leak into an `ATD`:
+   * a sticky setting would make the sound stop meaning what was typed. */
+  o1_sound_policy_set_tones(&o1nextPolicy, tones ? 1 : 0);
+  o1_dial_gate_reset(&o1nextDialGate);
+  o1nextDialPlaying = false;   /* a previous dial's tail must not mark this one */
+  o1nextDialDigits[0] = '\0';
+
+  if(!o1_sound_wants_dial(&o1nextPolicy))
+  {
+    /* A silent dial is still a dial: the socket opens and the connection is
+     * admitted the moment the link is up, because there are no tones to wait for.
+     * The `o1_dial_gate_reset` above is what makes that true -- an unarmed gate
+     * admits everything, which is what keeps an ordinary connection ordinary. */
+    debugPrintf("O1NEXT dial: silent (%s%s).\r\n", o1_speaker_name(o1nextSoundMode()),
+                tones ? ", +T" : "");
+    return;
+  }
+
+  if(!o1nextSoundUp)
+  {
+    debugPrintf("O1NEXT dial: no I2S, so there is nothing to wait for.\r\n");
+    return;
+  }
+
+  n = o1_dtmf_dial_build(&o1nextDial, connect, O1_DTMF_DIGITS_MAX);
+  if(n == 0u)
+  {
+    debugPrintf("O1NEXT dial: \"%s\" has no fingerprint.\r\n",
+                (connect != 0) ? connect : "(null)");
+    return;
+  }
+
+  strncpy(o1nextDialDigits, o1nextDial.digits, sizeof o1nextDialDigits - 1u);
+  o1nextDialDigits[sizeof o1nextDialDigits - 1u] = '\0';
+
+  /* Armed *before* playing, never after: a short score can finish inside this
+   * call on a slow enough loop, and arming afterwards would lose the fact. */
+  o1_dial_gate_arm(&o1nextDialGate);
+  o1nextSoundPlay(&o1nextDial.hs);
+  o1nextDialPlaying = o1nextPlaying;
+
+  debugPrintf("O1NEXT dial: %s, %u ms -- \"%s\".\r\n", o1nextDialDigits,
+              (unsigned)o1_hs_ms(&o1nextDial.hs),
+              (connect != 0) ? connect : "(null)");
+}
+
+void o1nextDialLinked(void)
+{
+  o1nextPolicyInit();
+  o1_dial_gate_linked(&o1nextDialGate);
+}
+
+void o1nextDialFailed(void)
+{
+  o1nextPolicyInit();
+  /* Not "the link dropped" -- that is a *disconnect*, and it happens after
+   * admission.  This is "the attempt failed", so there is nothing left to wait
+   * for and the next dial starts clean. */
+  o1_dial_gate_abort(&o1nextDialGate);
+  o1nextDialPlaying = false;
+  o1nextDialDigits[0] = '\0';
+}
+
+bool o1nextDialAdmitted(void)
+{
+  o1nextPolicyInit();
+  /* Armed *and* both facts.  An unarmed gate is admitted by definition -- there
+   * is no dial to wait for -- so a caller that needs to know whether an admission
+   * is a *deferred* one must ask `o1nextDialHolding()` first. */
+  return o1_dial_gate_armed(&o1nextDialGate) && o1_dial_gate_admitted(&o1nextDialGate);
+}
+
+bool o1nextDialHolding(void)
+{
+  o1nextPolicyInit();
+  /* A dial is running and has not been admitted: something is waiting. */
+  return o1_dial_gate_armed(&o1nextDialGate) && !o1_dial_gate_admitted(&o1nextDialGate);
+}
+
+void o1nextDialSpent(void)
+{
+  o1nextPolicyInit();
+  o1_dial_gate_reset(&o1nextDialGate);
+}
+
+const char *o1nextDialled(void)
+{
+  return (o1nextDialDigits[0] != '\0') ? o1nextDialDigits : NULL;
 }

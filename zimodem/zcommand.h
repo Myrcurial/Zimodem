@@ -239,6 +239,13 @@ class ZCommand : public ZMode
     int  o1nextRingCounter(void)       { return ringCounter; }
     bool o1nextPreserveListeners(void) { return preserveListeners; }
 
+    /* o1next (#322), option (c) of the dial: the `CONNECT` text that a dialled
+     * call holds back until its tones have finished.  `doDialStreamCommand`
+     * returns ZCONNECT and switches the stream immediately -- the machine gets
+     * its carrier -- but `case ZCONNECT:` skips the notice while a dial is
+     * running, and `loop()` sends it from here once the tones are done. */
+    void o1nextDialAdmit(void);
+
     ZCommand();
     void loadConfig();
     bool reSaveConfig(int retries); /* o1next: public, see the notice above */

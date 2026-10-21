@@ -27,6 +27,11 @@
  * is o1next_panel.ino, the sound is o1next_sound.ino, and everything both of
  * them *do* is in `o1modem/` in the o1next repository, host-tested.  What
  * this file carries is the wiring and nothing else.  Apache-2.0 4(b).
+ *
+ * MODIFIED again by the o1next project (#322) for option (c) of the dial: one
+ * guard in checkOpenConnections() and `o1nextDialPoll()`, which is the deferred
+ * half of a connection whose tones have not finished.  The command side of the
+ * dial is in zcommand.ino.  Apache-2.0 4(b).
  */
 //#define TCP_SND_BUF                     4 * TCP_MSS
 #define ZIMODEM_VERSION "4.0.3"
@@ -553,6 +558,14 @@ static int checkOpenConnections()
     if((dcdStatus == dcdInactive)
     &&(dcdStatus != dcdActive))
     {
+#ifdef O1NEXT_BOARD
+      /* o1next (#322), option (c): the socket is open, but a dial may still be
+       * playing.  The CD lamp and the connect sound are two of the three things
+       * "the connection exists" means, so they wait here; `o1nextDialPoll()`
+       * comes back through this function the moment the tones stop. */
+      if(o1nextDialHolding())
+        return num;
+#endif
       dcdStatus = dcdActive;
       s_pinWrite(pinDCD,dcdStatus);
 #ifdef O1NEXT_BOARD
@@ -566,6 +579,30 @@ static int checkOpenConnections()
   }
   return num;
 }
+
+#ifdef O1NEXT_BOARD
+/* o1next (#322), option (c): the deferred half of a dial.
+ *
+ * `ATDT` opens the socket, switches the stream and returns CONNECT *while the
+ * tones are still playing* -- the machine gets its carrier immediately, and the
+ * panel does not admit the connection exists until the dial has finished.  So the
+ * CD lamp and the CONNECT text were held back by `checkOpenConnections()` and
+ * `case ZCONNECT:`, and this is where they are released.
+ *
+ * It runs the same steps, in the same order, that those two places would have --
+ * which is the point: once this returns, an admitted dial and a connection that
+ * was never dialled are indistinguishable to everything watching.
+ */
+static void o1nextDialPoll()
+{
+  if(!o1nextDialAdmitted())
+    return;                     /* nothing held, or the tones are still going */
+
+  o1nextDialSpent();            /* the gate is spent, so the checks below pass */
+  checkOpenConnections();       /* the CD lamp, the connect sound, the baud switch */
+  commandMode.o1nextDialAdmit();/* and the CONNECT text, held since the ATDT */
+}
+#endif
 
 static int processPlusPlusPlus(uint8_t c)
 {
@@ -789,6 +826,9 @@ void loop()
 #ifdef O1NEXT_BOARD
   o1nextPanelLoop(); /* the lamps -- on change only (#322) */
   o1nextSoundLoop(); /* the speaker, fed from the DMA (#322) */
+  /* After the sound, so the gate's "the dial finished" fact is as fresh as it
+   * can be -- a dial that ended in the chunk above is admitted in this pass. */
+  o1nextDialPoll();  /* admit a connection whose dial has finished (#322) */
 #endif
   currMode->loop();
   zclock.tick();

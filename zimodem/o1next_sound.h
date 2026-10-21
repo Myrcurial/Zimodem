@@ -50,16 +50,54 @@ void o1nextSoundPlay(const o1_handshake *hs);
  * this is the convenience the named events below use. */
 void o1nextSoundPlayForRate(uint32_t mbaud);
 
+/* -------------------------------------------------------------- the speaker
+ *
+ * Hayes `ATM`, and the `T` in `ATDT`.  The table -- which sound a call makes,
+ * and why -- is `o1_sound_policy` in tone.h, where it is host-tested; this is
+ * the fork's single instance of it.
+ *
+ * **A mute is `ATM0`.**  `o1nextSoundMute` is kept because it is the boolean view
+ * of the same setting -- `true` is M0 and `false` is M1 -- and it is *not* a
+ * second mechanism.  Two mutes is exactly the drift this file's notice warns
+ * about.
+ */
+void        o1nextSoundSetMode(o1_speaker m);
+o1_speaker  o1nextSoundMode(void);
+const char *o1nextSoundModeName(void);
+
 /* The named events.  Each is one line in the modem's own code, and each is
  * deliberately a *function* rather than a call to `o1nextSoundPlay`, so that the
  * policy -- which sound, and whether to make one at all -- lives in one place. */
 void o1nextSoundConnect(uint32_t mbaud);  /* carrier up: the handshake */
 void o1nextSoundRing(void);               /* a ring, for the ring cadence */
-void o1nextSoundDial(void);               /* dial tone, while dialling */
+void o1nextSoundDial(void);               /* the exchange's dial tone, alone */
 void o1nextSoundDisconnect(void);
 void o1nextSoundMute(bool on);
 bool o1nextSoundIsMuted(void);
 bool o1nextSoundIsPlaying(void);
+
+/* ------------------------------------------------------- the dial, and the gate
+ *
+ * `ATDT <host>` plays a DTMF fingerprint of the connect string and then holds the
+ * connection back until the tones have finished -- option (c) of #322.  The
+ * socket, the stream and the machine's own CONNECT are immediate; what waits is
+ * the CD lamp and the `CONNECT` text, because those two are what "the connection
+ * exists" means to everything watching.
+ *
+ * The order of the calls is the shape of the thing: `Begin` before the connect
+ * attempt, so the tones play while the socket comes up; `Linked` or `Failed` when
+ * it answers; and the release, from `loop()`, once both facts are in.
+ */
+void o1nextDialBegin(const char *connect, bool tones);  /* arm, and dial if asked */
+void o1nextDialLinked(void);                            /* the link came up */
+void o1nextDialFailed(void);                            /* no link: nothing to wait for */
+bool o1nextDialAdmitted(void);                          /* both facts in: release it */
+bool o1nextDialHolding(void);                           /* a dial is holding one back */
+void o1nextDialSpent(void);                             /* released; stop asking */
+
+/* The fingerprint that was dialled, or NULL.  For the console: the sound and the
+ * log line say the same thing. */
+const char *o1nextDialled(void);
 
 /* What is playing, for the console.  NULL when silent. */
 const char *o1nextSoundWhat(void);
