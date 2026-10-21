@@ -48,6 +48,32 @@ if [ "$clean" = yes ]; then
 fi
 mkdir -p "$BUILD"
 
+# ---------------------------------------------------------------- the O1 core --
+# The parts that are *ours* -- the rate table, the 6850 frame decoder, the
+# double-sided buffer, the panel and the sound -- live in the **o1next**
+# repository, not here, because that is where the CI and the host tests are (see
+# BUILD.md, "Where the O1-specific core is").  Arduino compiles what is inside the
+# sketch directory, so the core is **vendored in** rather than copied into this
+# repository: two copies of the rate table is exactly how they drift.
+#
+#   O1NEXT_SRC   the o1next checkout; defaults to $HOME/GitHub/o1next
+#
+# The files are listed explicitly, so adding a .c to o1modem/ without adding it
+# here is a *link* error rather than a silently absent feature.  That is the right
+# way round: a missing file should stop the build.
+O1NEXT_SRC=${O1NEXT_SRC:-"$HOME/GitHub/o1next"}
+CORE_SRC="$O1NEXT_SRC/firmware/zimodem-fork/o1modem"
+CORE_FILES="rate.c rate.h frame.c frame.h buffer.c buffer.h panel.c panel.h tone.c tone.h"
+
+[ -d "$CORE_SRC" ] || die "no o1next core at $CORE_SRC -- set O1NEXT_SRC to your o1next checkout (BUILD.md)"
+
+say "== vendoring the o1next core from $CORE_SRC"
+for f in $CORE_FILES; do
+    [ -f "$CORE_SRC/$f" ] || die "$CORE_SRC/$f is missing"
+    cp "$CORE_SRC/$f" "$SKETCH/$f"
+done
+say "   ok   the core is in $SKETCH/ (gitignored -- it is a copy, not a source)"
+
 # --------------------------------------------------------------- properties --
 # Everything the merge needs is READ FROM THE PLATFORM rather than written down
 # here: the flash mode, frequency and size, and the bootloader's own offset.  A

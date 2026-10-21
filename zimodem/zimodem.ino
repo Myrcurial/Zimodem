@@ -20,6 +20,13 @@
  * o1next_console.ino, so what this file carries of the o1next work is the
  * notice, the define, the two-line branch, the CDC half of debugPrintf, the
  * two fixed arrays, and that one call.  Apache-2.0 section 4(b).
+ *
+ * MODIFIED by the o1next project (#322, part of #56) as well: three added
+ * lines in setup() and loop() for the panel and the sound, and two in
+ * checkOpenConnections() for the connect and disconnect events.  The panel
+ * is o1next_panel.ino, the sound is o1next_sound.ino, and everything both of
+ * them *do* is in `o1modem/` in the o1next repository, host-tested.  What
+ * this file carries is the wiring and nothing else.  Apache-2.0 4(b).
  */
 //#define TCP_SND_BUF                     4 * TCP_MSS
 #define ZIMODEM_VERSION "4.0.3"
@@ -532,6 +539,9 @@ static int checkOpenConnections()
     {
       dcdStatus = dcdInactive;
       s_pinWrite(pinDCD,dcdStatus);
+#ifdef O1NEXT_BOARD
+      o1nextSoundDisconnect();
+#endif
       if(baudState == BS_SWITCHED_TEMP)
         baudState = BS_SWITCH_NORMAL_NEXT;
       if(currMode == &commandMode)
@@ -545,6 +555,11 @@ static int checkOpenConnections()
     {
       dcdStatus = dcdActive;
       s_pinWrite(pinDCD,dcdStatus);
+#ifdef O1NEXT_BOARD
+      /* A carrier is up: this is where the modem makes its noise (#322).  The
+       * score follows the *feel* rate, not the ACIA rate -- see panel.h. */
+      o1nextSoundConnect(o1nextPanelFeelRate());
+#endif
       if((tempBaud > 0) && (baudState == BS_NORMAL))
         baudState = BS_SWITCH_TEMP_NEXT;
     }
@@ -675,6 +690,13 @@ void setup()
   s_pinWrite(DEFAULT_PIN_WIFI,(WiFi.status() == WL_CONNECTED)?DEFAULT_WIFI_ACTIVE:DEFAULT_WIFI_INACTIVE);
   s_pinWrite(DEFAULT_PIN_HS,(baudRate>=DEFAULT_HS_BAUD)?DEFAULT_HS_ACTIVE:DEFAULT_HS_INACTIVE);
 #endif
+#ifdef O1NEXT_BOARD
+  /* The panel and the sound (#322).  Both report their own failure and neither
+   * is fatal: a board with no expander is a board with no panel, not a board
+   * that will not be a modem. */
+  o1nextPanelBegin();
+  o1nextSoundBegin();
+#endif
 }
 
 void checkReconnect()
@@ -764,6 +786,10 @@ void loop()
   {
     currMode->serialIncoming();
   }
+#ifdef O1NEXT_BOARD
+  o1nextPanelLoop(); /* the lamps -- on change only (#322) */
+  o1nextSoundLoop(); /* the speaker, fed from the DMA (#322) */
+#endif
   currMode->loop();
   zclock.tick();
 }

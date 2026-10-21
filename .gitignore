@@ -2,5 +2,21 @@
 # the ordinary sense: regenerable with one command, and never committed.
 build/
 
+# The o1next core, vendored into the sketch by tools/build-o1next.sh.  It is a
+# *copy* of `firmware/zimodem-fork/o1modem/` from the o1next repository, which is
+# where it is authored, tested and versioned -- so it is not source here, and a
+# stray edit to one of these in this tree would be lost by the next build.
+# (The list must match CORE_FILES in tools/build-o1next.sh.)
+/zimodem/rate.c
+/zimodem/rate.h
+/zimodem/frame.c
+/zimodem/frame.h
+/zimodem/buffer.c
+/zimodem/buffer.h
+/zimodem/panel.c
+/zimodem/panel.h
+/zimodem/tone.c
+/zimodem/tone.h
+
 # Python bytecode, from running (or checking) the tools/ scripts.
 __pycache__/
