@@ -20,6 +20,18 @@
  * o1next_console.ino, so what this file carries of the o1next work is the
  * notice, the define, the two-line branch, the CDC half of debugPrintf, the
  * two fixed arrays, and that one call.  Apache-2.0 section 4(b).
+ *
+ * MODIFIED by the o1next project (#322, part of #56) as well: three added
+ * lines in setup() and loop() for the panel and the sound, and two in
+ * checkOpenConnections() for the connect and disconnect events.  The panel
+ * is o1next_panel.ino, the sound is o1next_sound.ino, and everything both of
+ * them *do* is in `o1modem/` in the o1next repository, host-tested.  What
+ * this file carries is the wiring and nothing else.  Apache-2.0 4(b).
+ *
+ * MODIFIED again by the o1next project (#322) for option (c) of the dial: one
+ * guard in checkOpenConnections() and `o1nextDialPoll()`, which is the deferred
+ * half of a connection whose tones have not finished.  The command side of the
+ * dial is in zcommand.ino.  Apache-2.0 4(b).
  */
 //#define TCP_SND_BUF                     4 * TCP_MSS
 #define ZIMODEM_VERSION "4.0.3"
@@ -532,6 +544,9 @@ static int checkOpenConnections()
     {
       dcdStatus = dcdInactive;
       s_pinWrite(pinDCD,dcdStatus);
+#ifdef O1NEXT_BOARD
+      o1nextSoundDisconnect();
+#endif
       if(baudState == BS_SWITCHED_TEMP)
         baudState = BS_SWITCH_NORMAL_NEXT;
       if(currMode == &commandMode)
@@ -543,14 +558,51 @@ static int checkOpenConnections()
     if((dcdStatus == dcdInactive)
     &&(dcdStatus != dcdActive))
     {
+#ifdef O1NEXT_BOARD
+      /* o1next (#322), option (c): the socket is open, but a dial may still be
+       * playing.  The CD lamp and the connect sound are two of the three things
+       * "the connection exists" means, so they wait here; `o1nextDialPoll()`
+       * comes back through this function the moment the tones stop. */
+      if(o1nextDialHolding())
+        return num;
+#endif
       dcdStatus = dcdActive;
       s_pinWrite(pinDCD,dcdStatus);
+#ifdef O1NEXT_BOARD
+      /* A carrier is up: this is where the modem makes its noise (#322).  The
+       * score follows the *feel* rate, not the ACIA rate -- see panel.h. */
+      o1nextSoundConnect(o1nextPanelFeelRate());
+#endif
       if((tempBaud > 0) && (baudState == BS_NORMAL))
         baudState = BS_SWITCH_TEMP_NEXT;
     }
   }
   return num;
 }
+
+#ifdef O1NEXT_BOARD
+/* o1next (#322), option (c): the deferred half of a dial.
+ *
+ * `ATDT` opens the socket, switches the stream and returns CONNECT *while the
+ * tones are still playing* -- the machine gets its carrier immediately, and the
+ * panel does not admit the connection exists until the dial has finished.  So the
+ * CD lamp and the CONNECT text were held back by `checkOpenConnections()` and
+ * `case ZCONNECT:`, and this is where they are released.
+ *
+ * It runs the same steps, in the same order, that those two places would have --
+ * which is the point: once this returns, an admitted dial and a connection that
+ * was never dialled are indistinguishable to everything watching.
+ */
+static void o1nextDialPoll()
+{
+  if(!o1nextDialAdmitted())
+    return;                     /* nothing held, or the tones are still going */
+
+  o1nextDialSpent();            /* the gate is spent, so the checks below pass */
+  checkOpenConnections();       /* the CD lamp, the connect sound, the baud switch */
+  commandMode.o1nextDialAdmit();/* and the CONNECT text, held since the ATDT */
+}
+#endif
 
 static int processPlusPlusPlus(uint8_t c)
 {
@@ -675,6 +727,13 @@ void setup()
   s_pinWrite(DEFAULT_PIN_WIFI,(WiFi.status() == WL_CONNECTED)?DEFAULT_WIFI_ACTIVE:DEFAULT_WIFI_INACTIVE);
   s_pinWrite(DEFAULT_PIN_HS,(baudRate>=DEFAULT_HS_BAUD)?DEFAULT_HS_ACTIVE:DEFAULT_HS_INACTIVE);
 #endif
+#ifdef O1NEXT_BOARD
+  /* The panel and the sound (#322).  Both report their own failure and neither
+   * is fatal: a board with no expander is a board with no panel, not a board
+   * that will not be a modem. */
+  o1nextPanelBegin();
+  o1nextSoundBegin();
+#endif
 }
 
 void checkReconnect()
@@ -764,6 +823,13 @@ void loop()
   {
     currMode->serialIncoming();
   }
+#ifdef O1NEXT_BOARD
+  o1nextPanelLoop(); /* the lamps -- on change only (#322) */
+  o1nextSoundLoop(); /* the speaker, fed from the DMA (#322) */
+  /* After the sound, so the gate's "the dial finished" fact is as fresh as it
+   * can be -- a dial that ended in the chunk above is admitted in this pass. */
+  o1nextDialPoll();  /* admit a connection whose dial has finished (#322) */
+#endif
   currMode->loop();
   zclock.tick();
 }

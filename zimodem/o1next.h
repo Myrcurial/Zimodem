@@ -128,9 +128,26 @@ static void o1next_usb_ready(void)
     }
 }
 
+/* The two I2C pins, from `hardware/wifi-comm-pac/pinmap.md` -- GPIO33/34, and
+ * they are the ESP32's I2C bus in BOTH roles (#322's decision), which is what
+ * lets one panel design serve the standalone module and the SFF board. */
+#define O1NEXT_I2C_SDA  GPIO_NUM_33
+#define O1NEXT_I2C_SCL  GPIO_NUM_34
+
+/* The I2S audio pins, from the same map: BCLK/LRCLK/DIN on GPIO35/36/37.  The
+ * MAX98357A (U8) takes them directly; there is no beeper pin, which is why
+ * DEFAULT_PIN_SND is -1. */
+#define O1NEXT_I2S_BCLK  GPIO_NUM_35
+#define O1NEXT_I2S_LRCLK GPIO_NUM_36
+#define O1NEXT_I2S_DIN   GPIO_NUM_37
+
 /* The read half of that console: the commands, in o1next_console.ino (#334).
  * Declared here so zimodem.ino's loop() can call it without depending on the
  * prototypes Arduino generates. */
 #include "o1next_console.h"
+
+/* The panel and the sound (#322).  Declared here for the same reason. */
+#include "o1next_panel.h"
+#include "o1next_sound.h"
 
 #endif /* O1NEXT_H */

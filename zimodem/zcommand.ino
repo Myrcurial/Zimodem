@@ -1847,7 +1847,19 @@ ZResult ZCommand::doDialStreamCommand(unsigned long vval, uint8_t *vbuf, int vle
         int addrLen=strlen(phb->address);
         uint8_t *vbuf = new uint8_t[addrLen+1];
         strcpy((char *)vbuf,phb->address);
+#ifdef O1NEXT_BOARD
+        /* o1next (#322): the caller's `T` survives the lookup.  An entry's stored
+         * modifiers describe the *destination*; whether this operator wants to
+         * hear the dial is a property of the call, and `ATDT 5` is a request to
+         * hear it.  Without this, `ATDT 5` would be silent while `ATDT host` was
+         * not -- one setting, two answers, decided by which one was typed. */
+        String dialMods = phb->modifiers;
+        if((strchr(dmodifiers,'t') != null) && (strchr(dialMods.c_str(),'t') == null))
+          dialMods += "t";
+        ZResult res = doDialStreamCommand(0,vbuf,addrLen,false,dialMods.c_str());
+#else
         ZResult res = doDialStreamCommand(0,vbuf,addrLen,false,phb->modifiers);
+#endif
         free(vbuf);
         return res;
     }
@@ -1892,16 +1904,30 @@ ZResult ZCommand::doDialStreamCommand(unsigned long vval, uint8_t *vbuf, int vle
     parseHostInfo(vbuf, &host, &port, &username, &password);
     if(port < 0)
       port = ((username != 0) && ((flagsBitmap&FLAG_SECURE)==FLAG_SECURE))?22:23;
+#ifdef O1NEXT_BOARD
+    /* o1next (#322): the dial.  **`ATD` is silent and `ATDT` is not** -- the `T`
+     * is the operator's choice, made per call, so it is read from the modifiers
+     * and not from a setting.  Option (c): the tones start *now*, so they play
+     * while the socket comes up, and the connection is not *admitted* until they
+     * have finished -- see `o1nextDialAdmit()`. */
+    o1nextDialBegin((const char *)vbuf, strchr(dmodifiers,'t') != null);
+#endif
     WiFiClientNode *c = new WiFiClientNode(host,port,username,password,flagsBitmap | FLAG_DISCONNECT_ON_EXIT);
     if(!c->isConnected())
     {
       delete c;
+#ifdef O1NEXT_BOARD
+      o1nextDialFailed();   /* no link: there is nothing left to wait for */
+#endif
       return ZNOANSWER;
     }
     else
     {
       current=c;
       connectionArgs(c);
+#ifdef O1NEXT_BOARD
+      o1nextDialLinked();   /* the link is up; the tones may still be playing */
+#endif
       if(strchr(dmodifiers,';')==0)
         streamMode.switchTo(c);
       return ZCONNECT;
@@ -1909,6 +1935,27 @@ ZResult ZCommand::doDialStreamCommand(unsigned long vval, uint8_t *vbuf, int vle
   }
   return ZOK;
 }
+
+#ifdef O1NEXT_BOARD
+/* o1next (#322), option (c) of the dial: the `CONNECT` that `case ZCONNECT:`
+ * held back, sent now that the tones have finished.
+ *
+ * It is the same expression that case would have sent, in the same place, so that
+ * an admitted dial and a connection that was never dialled are indistinguishable
+ * to the machine.  The alternative -- a second copy of the expression out here --
+ * is how the two come to disagree.
+ *
+ * The connection can have died in the second and a half it waited, and a CONNECT
+ * for a dead socket is a lie the machine then acts on.  So it is checked, and the
+ * NO CARRIER that follows says what actually happened. */
+void ZCommand::o1nextDialAdmit(void)
+{
+  if(WiFiClientNode::getNumOpenWiFiConnections() == 0)
+    return;
+
+  sendConnectionNotice(((current == null)||(autoStreamMode)) ? baudRate : current->id);
+}
+#endif
 
 ZResult ZCommand::doPhonebookCommand(unsigned long vval, uint8_t *vbuf, int vlen, bool isNumber, const char *dmodifiers)
 {
@@ -2879,6 +2926,42 @@ ZResult ZCommand::doSerialCommand()
         result = doLastPacket(vval,vbuf,vlen,isNumber);
         break;
       case 'm':
+#ifdef O1NEXT_BOARD
+        /* o1next (#322): Hayes' `M` is *speaker control*, and this fork is the
+         * first thing in this tree that can make a sound -- so the stub that
+         * accepted `ATM<n>` and threw it away now does the thing it says.
+         *
+         *   M0  the speaker is off
+         *   M1  on until carrier detected        (the default)
+         *   M2  always on -- so the disconnect is audible
+         *   M3  on during the dial only
+         *
+         * `ATM` with no digit reports the mode.  How this composes with the `T`
+         * in `ATDT` is `o1_sound_policy` in o1modem/tone.h, host-tested. */
+        if(!isNumber)
+          result = ZERROR;
+        else
+        if(vlen == 0)
+        {
+          serial.prints(o1nextSoundModeName());
+          serial.prints(EOLN);
+          result = ZOK;
+        }
+        else
+        {
+          o1_speaker speakerMode;
+          if(o1_speaker_from_digit((int)vval, &speakerMode))
+          {
+            o1nextSoundSetMode(speakerMode);
+            result = ZOK;
+          }
+          else
+            result = ZERROR;
+        }
+#else
+        result = isNumber ? ZOK : ZERROR;
+#endif
+        break;
       case 'y':
         result = isNumber ? ZOK : ZERROR;
         break;
@@ -3562,6 +3645,14 @@ void ZCommand::sendOfficialResponse(ZResult res)
       break;
     case ZCONNECT:
       logPrintln("Response: Connected!");
+#ifdef O1NEXT_BOARD
+      /* o1next (#322), option (c): a dialled connection is live -- the socket is
+       * open and the stream has switched -- but it is not *admitted* while its
+       * tones are still playing, so the CONNECT text waits.  `loop()` sends it,
+       * through `o1nextDialAdmit()`, the moment they stop. */
+      if(o1nextDialHolding())
+        break;
+#endif
       sendConnectionNotice(((current == null)||(autoStreamMode)) ? baudRate : current->id);
       break;
     default:

@@ -23,6 +23,14 @@
  * set a network but not remember it.  The alternative was a file of its own,
  * and two places that can hold an SSID is how a board ends up on the wrong
  * network.  Visibility only: no behaviour changed.
+ *
+ * MODIFIED by the o1next project (#322, part of #56) as well: two accessors
+ * added to the public section, `o1nextRingCounter()` and
+ * `o1nextPreserveListeners()`.  The panel has an RI lamp and an AA lamp, and
+ * both are driven from state that was private; two reads do not justify a
+ * friend declaration, and the alternative -- re-deriving "is it ringing" in
+ * the panel from something else -- is a second source of truth for one fact.
+ * Visibility only: no behaviour changed, no field moved.  Apache-2.0 4(b).
  */
 
 
@@ -224,6 +232,19 @@ class ZCommand : public ZMode
     String  EOLN;
     char    EC                  = '+';
     char    ECS[32];
+
+    /* o1next (#322): the panel's RI and AA lamps need two pieces of state
+     * that were private.  Two reads do not justify a friend declaration, so
+     * they get accessors instead -- see the file notice at the top. */
+    int  o1nextRingCounter(void)       { return ringCounter; }
+    bool o1nextPreserveListeners(void) { return preserveListeners; }
+
+    /* o1next (#322), option (c) of the dial: the `CONNECT` text that a dialled
+     * call holds back until its tones have finished.  `doDialStreamCommand`
+     * returns ZCONNECT and switches the stream immediately -- the machine gets
+     * its carrier -- but `case ZCONNECT:` skips the notice while a dial is
+     * running, and `loop()` sends it from here once the tones are done. */
+    void o1nextDialAdmit(void);
 
     ZCommand();
     void loadConfig();

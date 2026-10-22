@@ -12,7 +12,14 @@
    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
    See the License for the specific language governing permissions and
    limitations under the License.
-*/
+*
+ * MODIFIED by the o1next project (#322, part of #56): two calls added, one in
+ * serialIncoming() and one in loop(), to pulse the panel's SD and RD lamps.
+ * They are the two places a byte crosses this class, so they are the only two
+ * places a data lamp could honestly be driven from -- and the lamps themselves
+ * (the map, the monostable, the register bytes) are in `o1modem/panel.c` in the
+ * o1next repository, host-tested.  Apache-2.0 section 4(b).
+ */
 
 void ZStream::switchTo(WiFiClientNode *conn)
 {
@@ -82,6 +89,12 @@ void ZStream::serialIncoming()
   int bytesAvailable = HWSerial.available();
   if(bytesAvailable == 0)
     return;
+#ifdef O1NEXT_BOARD
+  /* The machine is sending: light SD (#322).  One pulse per *burst*, not per
+   * byte -- the window in o1_panel is what stretches a byte into something an
+   * eye can see, and pulsing per byte would be the same lamp with more calls. */
+  o1nextPanelSdPulse();
+#endif
   uint8_t escBufDex = 0;
   while(--bytesAvailable >= 0)
   {
@@ -326,6 +339,10 @@ void ZStream::loop()
       int bufferRemaining=serialOutBufferBytesRemaining();
       if(bufferRemaining > 0)
       {
+#ifdef O1NEXT_BOARD
+        /* Data is on its way to the machine: light RD (#322). */
+        o1nextPanelRdPulse();
+#endif
         int bytesAvailable = current->available();
         if(bytesAvailable > bufferRemaining)
           bytesAvailable = bufferRemaining;

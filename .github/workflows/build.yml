@@ -86,6 +86,37 @@ jobs:
           arduino-cli core update-index
           arduino-cli core install esp32:esp32@2.0.17
 
+      # The core is **not** in this repository: tools/build-o1next.sh vendors it in
+      # from an o1next checkout at build time (BUILD.md).  So CI needs one, and this
+      # step is why the job can pass at all -- without it the script exits with
+      # "no o1next core at .../o1modem", which reads like a broken build rather
+      # than a missing input.
+      #
+      # It takes the **same-named** branch when o1next has one, because the two
+      # repositories are changed together: a fork branch and its core branch are
+      # one unit of work, and the *pair* is what has to build.  `main` is the
+      # fallback, for a fork branch whose core is already merged.
+      #
+      # It is a **sparse, partial** clone.  `research/` in o1next is an intentional
+      # archive of manuals and disk images -- hundreds of megabytes, and none of it
+      # compiles anything.  Only firmware/zimodem-fork/o1modem/ is fetched.
+      - name: Fetch the o1next core
+        env:
+          O1NEXT_REF: ${{ github.head_ref || github.ref_name }}
+        run: |
+          src="$RUNNER_TEMP/o1next-src"
+          clone() {
+            git clone --quiet --depth 1 --filter=blob:none --sparse \
+              --branch "$1" https://github.com/Myrcurial/o1next.git "$src"
+          }
+          clone "$O1NEXT_REF" || clone main
+          git -C "$src" sparse-checkout set firmware/zimodem-fork/o1modem
+          echo "O1NEXT_SRC=$src" >> "$GITHUB_ENV"
+          echo "o1next core: $(git -C "$src" rev-parse --short HEAD)" \
+               "on $(git -C "$src" rev-parse --abbrev-ref HEAD)" \
+               "(asked for $O1NEXT_REF)"
+          find "$src/firmware/zimodem-fork/o1modem" -maxdepth 1 -type f | sort
+
       - name: Build, merge and verify
         run: tools/build-o1next.sh
 
